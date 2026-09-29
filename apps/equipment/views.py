@@ -125,64 +125,99 @@ def model_equipment_create(request, model_id):
 
 
 @csrf_exempt
-@require_http_methods(['PATCH'])
+@require_http_methods(["PATCH"])
 def model_equipment_update(request, model_id, equip_id):
     ctx, err = get_org_context(request)
     if err:
         return err
-    m = get_object_or_404(RMCMModel, id=model_id, organization_id=ctx.organization.id)
+
+    model = get_object_or_404(
+        RMCMModel,
+        id=model_id,
+        organization_id=ctx.organization.id,
+    )
+
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse(
+            {"error": "Invalid JSON"},
+            status=400,
+        )
 
-    eq = _resolve_equipment(m, equip_id, ctx.organization)
-    if eq is None:
-        return JsonResponse({'error': 'Equipment not found for this model'}, status=404)
+    equipment = _resolve_equipment(
+        model,
+        equip_id,
+        ctx.organization,
+    )
 
-    if 'name' in data:
-        eq.name = data['name']
-    if 'count' in data:
-        eq.count = data['count']
-    if 'mttf' in data:
-        eq.mttf_minutes = data['mttf']
-    if 'mttr' in data:
-        eq.mttr_minutes = data['mttr']
-    if 'overtime_pct' in data:
-        eq.overtime_percent = data['overtime_pct']
-    if 'dept_code' in data:
-        eq.department_area = data['dept_code'] or None
-    if 'out_of_area' in data:
-        eq.out_of_area_equipment = data['out_of_area']
-    if 'unavail_pct' in data:
-        eq.percent_time_unavailable = data['unavail_pct']
-    if 'setup_factor' in data:
-        eq.setup_factor = data['setup_factor']
-    if 'run_factor' in data:
-        eq.run_factor = data['run_factor']
-    if 'var_factor' in data:
-        eq.variability_factor = data['var_factor']
-    for key in ('eq1', 'eq2', 'eq3', 'eq4'):
-        if key in data:
-            setattr(eq, key, data[key])
-    if 'comments' in data:
-        eq.comments = data['comments']
-    if 'labor_group_id' in data:
-        labor_group_id = data.get('labor_group_id') or None
-        if labor_group_id:
-            try:
-                eq.labor_group = Labor.objects.get(id=labor_group_id)
-            except Labor.DoesNotExist:
-                eq.labor_group = None
-        else:
-            eq.labor_group = None
-    if 'equip_type' in data:
-        equip_type = (data.get('equip_type') or 'standard').lower()
-        eq.equipment_type = 'Delay' if equip_type == 'delay' else 'Standard'
+    if equipment is None:
+        return JsonResponse(
+            {"error": "Equipment not found for this model"},
+            status=404,
+        )
 
-    eq.save()
+    _update_equipment_fields(equipment, data)
+    _update_equipment_labor_group(equipment, data)
+    _update_equipment_type(equipment, data)
+
+    equipment.save()
 
     return JsonResponse({})
 
+def _update_equipment_fields(eq, data):
+    field_map = {
+        "name": "name",
+        "count": "count",
+        "mttf": "mttf_minutes",
+        "mttr": "mttr_minutes",
+        "overtime_pct": "overtime_percent",
+        "unavail_pct": "percent_time_unavailable",
+        "setup_factor": "setup_factor",
+        "run_factor": "run_factor",
+        "var_factor": "variability_factor",
+        "comments": "comments",
+    }
+
+    for request_field, model_field in field_map.items():
+        if request_field in data:
+            setattr(eq, model_field, data[request_field])
+
+    if "dept_code" in data:
+        eq.department_area = data["dept_code"] or None
+
+    if "out_of_area" in data:
+        eq.out_of_area_equipment = data["out_of_area"]
+
+    for key in ("eq1", "eq2", "eq3", "eq4"):
+        if key in data:
+            setattr(eq, key, data[key])
+
+def _update_equipment_labor_group(eq, data):
+    if "labor_group_id" not in data:
+        return
+
+    labor_group_id = data.get("labor_group_id")
+
+    if not labor_group_id:
+        eq.labor_group = None
+        return
+
+    try:
+        eq.labor_group = Labor.objects.get(id=labor_group_id)
+    except Labor.DoesNotExist:
+        eq.labor_group = None
+
+def _update_equipment_type(eq, data):
+    if "equip_type" not in data:
+        return
+
+    equip_type = (data.get("equip_type") or "standard").lower()
+
+    eq.equipment_type = (
+        "Delay"
+        if equip_type == "delay"
+        else "Standard"
+    )
 
 @csrf_exempt
 @require_http_methods(['DELETE'])

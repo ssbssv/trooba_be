@@ -39,9 +39,10 @@ def _env_list(name: str, default: str) -> list[str]:
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv(
     "SECRET_KEY",
-    "django-insecure-c@f^1hu-whjoo+5ls%f#s5rmm4y1gkov0@1@=^g#nuk%a5ea=_",
+    
 )
-
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set.")
 # GCP/live: set DEBUG=0 in backend/.env on the server.
 DEBUG = _env_bool("DEBUG", "True")
 
@@ -84,12 +85,13 @@ INSTALLED_APPS = [
     "apps.auth",
     "apps.ibom",
     "apps.generaldata",
+    "apps.ai",
     "apps.admin.apps.TfAdminConfig",
 ]
 
 # TF Admin portal (override via environment in production)
 TF_ADMIN_EMAIL = os.getenv("TF_ADMIN_EMAIL", "admin@gmail.com")
-TF_ADMIN_PASSWORD = os.getenv("TF_ADMIN_PASSWORD", "12345678")
+TF_ADMIN_PASSWORD = os.getenv("TF_ADMIN_PASSWORD")
 
 MIDDLEWARE = [
     # CorsMiddleware must be first (production requirement for browser API calls).
@@ -184,7 +186,7 @@ DATABASES = {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": os.getenv("DB_NAME", "RMCT"),
         "USER": os.getenv("DB_USER", "postgres"),
-        "PASSWORD": os.getenv("DB_PASSWORD", "Neer@j9511"),
+        "PASSWORD": os.getenv("DB_PASSWORD"),
         "HOST": os.getenv("DB_HOST", "localhost"),
         "PORT": os.getenv("DB_PORT", "5432"),
     }
@@ -284,3 +286,42 @@ STATIC_URL = "static/"
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# ─── Trooba Flow AI (Version 1) ───────────────────────────────────────────
+# Provider: openai | gemini | anthropic | mock
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock").strip().lower()
+LLM_MODEL = os.getenv("LLM_MODEL", "").strip() or {
+    "openai": "gpt-4o-mini",
+    "gemini": "gemini-2.0-flash",
+    "google": "gemini-2.0-flash",
+    "anthropic": "claude-sonnet-4-20250514",
+    "claude": "claude-sonnet-4-20250514",
+    "mock": "mock",
+}.get(LLM_PROVIDER, "gpt-4o-mini")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta",
+).strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").strip()
+ANTHROPIC_API_VERSION = os.getenv("ANTHROPIC_API_VERSION", "2023-06-01").strip()
+
+SUMMARY_THRESHOLD_MESSAGES = int(os.getenv("SUMMARY_THRESHOLD_MESSAGES", "20"))
+SUMMARY_THRESHOLD_TOKENS = int(os.getenv("SUMMARY_THRESHOLD_TOKENS", "6000"))
+MAX_RECENT_MESSAGES = int(os.getenv("MAX_RECENT_MESSAGES", "12"))
+
+# Chat session lifecycle
+# Inactivity only — active messaging never expires the session mid-conversation.
+CHAT_SESSION_INACTIVITY_TIMEOUT_SECONDS = int(
+    os.getenv("CHAT_SESSION_INACTIVITY_TIMEOUT_SECONDS", "3600")
+)
+# prompt_new (Option A): return session_expired; client shows "New Chat".
+# auto_new (Option B): create a new ChatSession and continue the turn.
+CHAT_SESSION_EXPIRY_BEHAVIOR = (
+    os.getenv("CHAT_SESSION_EXPIRY_BEHAVIOR", "prompt_new").strip().lower()
+    or "prompt_new"
+)

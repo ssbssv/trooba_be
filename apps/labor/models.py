@@ -33,7 +33,7 @@ class Labor(models.Model):
 
     unavailability_percent = models.FloatField(default=0)
 
-    department = models.CharField(max_length=255, null=True, blank=True)
+    department = models.CharField(max_length=255, blank=True)
 
     setup_factor = models.FloatField(default=1)
 
@@ -48,7 +48,7 @@ class Labor(models.Model):
     lab3 = models.FloatField(null=True, blank=True)
     lab4 = models.FloatField(null=True, blank=True)
 
-    notes = models.TextField(null=True, blank=True)
+    notes = models.TextField(blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 

@@ -18,7 +18,13 @@ def load_dotenv() -> None:
             key = key.strip()
             if key.startswith("$env:"):
                 key = key[5:].strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            # Strip unquoted inline comments: KEY=value # comment
+            if value and not (value.startswith('"') or value.startswith("'")):
+                hash_at = value.find(" #")
+                if hash_at != -1:
+                    value = value[:hash_at].rstrip()
+            value = value.strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
     except OSError:

@@ -35,8 +35,7 @@ class Product(models.Model):
 
     department_area = models.CharField(
         max_length=255,
-        null=True,
-        blank=True
+        blank=True,
     )
 
     demand_factor = models.FloatField(default=1)
@@ -54,7 +53,7 @@ class Product(models.Model):
     prod3 = models.FloatField(default=0)
     prod4 = models.FloatField(default=0)
 
-    comments = models.TextField(null=True, blank=True)
+    comments = models.TextField( blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 

@@ -1,7 +1,6 @@
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import ensure_csrf_cookie, csrf_exempt
-from django.conf import settings
 import json
 import uuid
 from django.contrib.auth import login, logout
@@ -9,6 +8,7 @@ from django.utils.text import slugify
 from apps.organizations.models import Organization
 from apps.organizations.models import OrganizationMember
 from apps.organizations.provisioning import ensure_user_organization_if_needed
+from apps.auth.cookies import clear_auth_cookies
 from .models import create_user_account, authenticate_user, get_profile_payload, UserProfile
 
 
@@ -63,6 +63,7 @@ def signup(request):
 
 
 @csrf_exempt
+@ensure_csrf_cookie
 @require_http_methods(["POST"])
 def login_view(request):
     try:
@@ -225,7 +226,5 @@ def logout_view(request):
     logout(request)
 
     response = JsonResponse({"message": "Logged out"})
-    # Explicitly clear session and CSRF cookies on the client.
-    response.delete_cookie(settings.SESSION_COOKIE_NAME)
-    response.delete_cookie("csrftoken")
+    clear_auth_cookies(response)
     return response

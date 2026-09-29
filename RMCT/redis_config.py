@@ -17,12 +17,9 @@ def redis_url() -> str:
 
 
 def channels_redis_hosts() -> list:
-    """channels_redis host entries with explicit socket timeouts."""
     return [
         {
             "address": redis_url(),
-            "socket_timeout": redis_socket_timeout(),
-            "socket_connect_timeout": redis_connect_timeout(),
         }
     ]
 
@@ -35,3 +32,4 @@ def async_redis_kwargs() -> dict:
         "health_check_interval": 30,
         "retry_on_timeout": True,
     }
+

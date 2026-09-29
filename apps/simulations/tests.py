@@ -4,6 +4,7 @@ from unittest import mock
 from django.test import RequestFactory, SimpleTestCase
 
 from apps.simulations.dll_full_calculate import (
+    _apply_scenario,
     canonicalize_routing_for_dll,
     DllRunDiagnostics,
     _build_dll_model_payload,
@@ -92,6 +93,53 @@ class FullCalculateViewTests(SimpleTestCase):
         self.assertTrue(any("DLL routing solver failed" in w for w in body["results"]["warnings"]))
         self.assertEqual(body["results"]["errors"], [])
         fallback_mock.assert_called_once()
+
+
+class ApplyScenarioTests(SimpleTestCase):
+    def test_routing_change_on_operation_updates_setup_times(self):
+        model = {
+            "operations": [
+                {
+                    "id": "op-1",
+                    "product_id": "prod-1",
+                    "op_name": "MILL",
+                    "equip_setup_lot": 30.0,
+                    "labor_setup_lot": 20.0,
+                }
+            ],
+            "routing": [
+                {
+                    "id": "route-1",
+                    "product_id": "prod-1",
+                    "from_op_name": "DOCK",
+                    "to_op_name": "MILL",
+                    "pct_routed": 100.0,
+                }
+            ],
+        }
+        scenario = {
+            "changes": [
+                {
+                    "dataType": "Routing",
+                    "entityId": "op-1",
+                    "field": "equip_setup_lot",
+                    "whatIfValue": 5,
+                },
+                {
+                    "dataType": "Routing",
+                    "entityId": "route-1",
+                    "field": "pct_routed",
+                    "whatIfValue": 80,
+                },
+            ]
+        }
+
+        applied = _apply_scenario(model, scenario)
+
+        self.assertEqual(applied["operations"][0]["equip_setup_lot"], 5.0)
+        self.assertEqual(applied["operations"][0]["labor_setup_lot"], 20.0)
+        self.assertEqual(applied["routing"][0]["pct_routed"], 80.0)
+        self.assertEqual(model["operations"][0]["equip_setup_lot"], 30.0)
 
 
 class RoutingRepairTests(SimpleTestCase):

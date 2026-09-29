@@ -51,38 +51,101 @@ def _assert_id_owned_by_model(model_cls, entity_label: str, row_id: uuid.UUID, m
 
 
 def validate_snapshot_scope(m: RMCMModel, snap: dict) -> None:
-    """Pre-flight: ensure snapshot does not reference foreign model rows."""
     snap = snap or {}
-    for item in snap.get("labor") or []:
-        lid = _parse_uuid(item.get("id"))
-        if lid:
-            _assert_id_owned_by_model(Labor, "Labor", lid, m)
-    for item in snap.get("equipment") or []:
-        eid = _parse_uuid(item.get("id"))
-        if eid:
-            _assert_id_owned_by_model(EquipmentGroup, "Equipment", eid, m)
-    for item in snap.get("products") or []:
-        pid = _parse_uuid(item.get("id"))
-        if pid:
-            _assert_id_owned_by_model(Product, "Product", pid, m)
-    snapshot_product_ids = {
-        str(_parse_uuid(item.get("id")))
-        for item in (snap.get("products") or [])
-        if _parse_uuid(item.get("id"))
+
+    _validate_model_ids(
+        snap.get("labor") or [],
+        Labor,
+        "Labor",
+        m,
+    )
+
+    _validate_model_ids(
+        snap.get("equipment") or [],
+        EquipmentGroup,
+        "Equipment",
+        m,
+    )
+
+    products = snap.get("products") or []
+
+    _validate_model_ids(
+        products,
+        Product,
+        "Product",
+        m,
+    )
+
+    snapshot_product_ids = _snapshot_product_ids(products)
+
+    _validate_operation_scope(
+        m,
+        snap.get("operations") or [],
+        snapshot_product_ids,
+    )
+
+def _validate_model_ids(items, model_cls, entity_label, m):
+    for item in items:
+        row_id = _parse_uuid(item.get("id"))
+        if row_id:
+            _assert_id_owned_by_model(
+                model_cls,
+                entity_label,
+                row_id,
+                m,
+            )
+
+def _snapshot_product_ids(products):
+    return {
+        str(pid)
+        for pid in (
+            _parse_uuid(item.get("id"))
+            for item in products
+        )
+        if pid
     }
-    for item in snap.get("operations") or []:
-        oid = _parse_uuid(item.get("id"))
-        if oid:
-            op = Operation.objects.filter(id=oid).select_related("product").first()
-            if op is not None and op.product.model_id != m.id:
-                raise SnapshotScopeError(f"Operation id {oid} does not belong to this model")
-        pid = _parse_uuid(item.get("product_id"))
-        if pid:
-            prod = Product.objects.filter(id=pid).first()
-            if prod is not None and prod.model_id != m.id:
-                raise SnapshotScopeError(f"Product id {pid} does not belong to this model")
-            if prod is None and str(pid) not in snapshot_product_ids:
-                raise SnapshotScopeError(f"Operation references unknown product id {pid}")
+
+def _validate_operation_scope(m, operations, snapshot_product_ids):
+    for item in operations:
+        operation_id = _parse_uuid(item.get("id"))
+        if operation_id:
+            operation = (
+                Operation.objects
+                .filter(id=operation_id)
+                .select_related("product")
+                .first()
+            )
+
+            if (
+                operation is not None
+                and operation.product.model_id != m.id
+            ):
+                raise SnapshotScopeError(
+                    f"Operation id {operation_id} does not belong to this model"
+                )
+
+        product_id = _parse_uuid(item.get("product_id"))
+        if not product_id:
+            continue
+
+        product = Product.objects.filter(id=product_id).first()
+
+        if (
+            product is not None
+            and product.model_id != m.id
+        ):
+            raise SnapshotScopeError(
+                f"Product id {product_id} does not belong to this model"
+            )
+
+        if (
+            product is None
+            and str(product_id) not in snapshot_product_ids
+        ):
+            raise SnapshotScopeError(
+                f"Operation references unknown product id {product_id}"
+            )
+
 
 
 def _restore_general(m: RMCMModel, general: dict) -> None:
@@ -144,7 +207,7 @@ def _restore_labor(m: RMCMModel, org, items: list) -> None:
             "count": item.get("count", 1),
             "overtime_percent": item.get("overtime_pct", 0),
             "unavailability_percent": item.get("unavail_pct", 0),
-            "department": item.get("dept_code") or None,
+            "department": item.get("dept_code") or "",
             "setup_factor": item.get("setup_factor", 1),
             "run_factor": item.get("run_factor", 1),
             "variable_factor": item.get("var_factor", 1),
@@ -167,56 +230,107 @@ def _restore_labor(m: RMCMModel, org, items: list) -> None:
 
 
 def _restore_equipment(m: RMCMModel, org, items: list) -> None:
-    keep: set[uuid.UUID] = set()
-    for item in items:
-        eid = _parse_uuid(item.get("id"))
-        if eid:
-            keep.add(eid)
-    _soft_delete_extras(EquipmentGroup.objects.filter(model=m), keep)
+    keep = _equipment_keep_ids(items)
+
+    _soft_delete_extras(
+        EquipmentGroup.objects.filter(model=m),
+        keep,
+    )
 
     for item in items:
-        eid = _parse_uuid(item.get("id"))
-        if not eid:
+        equipment_id = _parse_uuid(item.get("id"))
+
+        if not equipment_id:
             continue
-        equip_type = (item.get("equip_type") or "standard").lower()
-        equipment_type = "Delay" if equip_type == "delay" else "Standard"
 
-        labor_group = None
-        lg_id = _parse_uuid(item.get("labor_group_id"))
-        if lg_id:
-            labor_group = Labor.objects.filter(id=lg_id, model=m).first()
+        fields = _equipment_fields(
+            m,
+            org,
+            item,
+        )
 
-        fields = {
-            "organization": org,
-            "model": m,
-            "name": (item.get("name") or "").upper(),
-            "count": item.get("count", 1),
-            "mttf_minutes": item.get("mttf", 0),
-            "mttr_minutes": item.get("mttr", 0),
-            "overtime_percent": item.get("overtime_pct", 0),
-            "labor_group": labor_group,
-            "department_area": item.get("dept_code") or None,
-            "out_of_area_equipment": item.get("out_of_area", False),
-            "percent_time_unavailable": item.get("unavail_pct", 0),
-            "setup_factor": item.get("setup_factor", 1),
-            "run_factor": item.get("run_factor", 1),
-            "variability_factor": item.get("var_factor", 1),
-            "eq1": item.get("eq1", 0),
-            "eq2": item.get("eq2", 0),
-            "eq3": item.get("eq3", 0),
-            "eq4": item.get("eq4", 0),
-            "comments": item.get("comments", ""),
-            "equipment_type": equipment_type,
-            "deleted_at": None,
-        }
-        row = EquipmentGroup.objects.filter(id=eid, model=m).first()
-        if row:
-            for key, val in fields.items():
-                setattr(row, key, val)
-            row.save()
-        else:
-            _assert_id_owned_by_model(EquipmentGroup, "Equipment", eid, m)
-            EquipmentGroup.objects.create(id=eid, **fields)
+        _save_equipment_row(
+            m,
+            equipment_id,
+            fields,
+        )
+
+def _equipment_keep_ids(items):
+    keep = set()
+
+    for item in items:
+        equipment_id = _parse_uuid(item.get("id"))
+        if equipment_id:
+            keep.add(equipment_id)
+
+    return keep
+
+def _equipment_labor_group(model, item):
+    labor_group_id = _parse_uuid(item.get("labor_group_id"))
+
+    if not labor_group_id:
+        return None
+
+    return Labor.objects.filter(
+        id=labor_group_id,
+        model=model,
+    ).first()
+
+def _equipment_fields(model, organization, item):
+    equipment_type = (
+        "Delay"
+        if (item.get("equip_type") or "standard").lower() == "delay"
+        else "Standard"
+    )
+
+    return {
+        "organization": organization,
+        "model": model,
+        "name": (item.get("name") or "").upper(),
+        "count": item.get("count", 1),
+        "mttf_minutes": item.get("mttf", 0),
+        "mttr_minutes": item.get("mttr", 0),
+        "overtime_percent": item.get("overtime_pct", 0),
+        "labor_group": _equipment_labor_group(model, item),
+        "department_area": item.get("dept_code") or None,
+        "out_of_area_equipment": item.get("out_of_area", False),
+        "percent_time_unavailable": item.get("unavail_pct", 0),
+        "setup_factor": item.get("setup_factor", 1),
+        "run_factor": item.get("run_factor", 1),
+        "variability_factor": item.get("var_factor", 1),
+        "eq1": item.get("eq1", 0),
+        "eq2": item.get("eq2", 0),
+        "eq3": item.get("eq3", 0),
+        "eq4": item.get("eq4", 0),
+        "comments": item.get("comments", ""),
+        "equipment_type": equipment_type,
+        "deleted_at": None,
+    }
+
+def _save_equipment_row(model, equipment_id, fields):
+    row = EquipmentGroup.objects.filter(
+        id=equipment_id,
+        model=model,
+    ).first()
+
+    if row:
+        for key, value in fields.items():
+            setattr(row, key, value)
+        row.save()
+        return
+
+    _assert_id_owned_by_model(
+        EquipmentGroup,
+        "Equipment",
+        equipment_id,
+        model,
+    )
+
+    EquipmentGroup.objects.create(
+        id=equipment_id,
+        **fields,
+    )
+    
 
 
 def _restore_products(m: RMCMModel, org, items: list) -> None:
@@ -238,7 +352,7 @@ def _restore_products(m: RMCMModel, org, items: list) -> None:
             "end_demand": item.get("demand", 0),
             "lot_size": item.get("lot_size", 1),
             "transfer_batch": item.get("tbatch_size", -1),
-            "department_area": item.get("dept_code") or None,
+            "department_area": item.get("dept_code") or "",
             "demand_factor": item.get("demand_factor", 1),
             "lot_factor": item.get("lot_factor", 1),
             "variability_factor": item.get("var_factor", 1),
@@ -262,148 +376,355 @@ def _restore_products(m: RMCMModel, org, items: list) -> None:
 
 
 def _restore_operations(m: RMCMModel, org, items: list) -> None:
-    product_ids = Product.objects.filter(model=m).values_list("id", flat=True)
-    keep: set[uuid.UUID] = set()
-    for item in items:
-        oid = _parse_uuid(item.get("id"))
-        if oid:
-            keep.add(oid)
-    _soft_delete_extras(Operation.objects.filter(product_id__in=product_ids), keep)
+    product_ids = Product.objects.filter(
+        model=m,
+    ).values_list("id", flat=True)
+
+    keep = _operation_keep_ids(items)
+
+    _soft_delete_extras(
+        Operation.objects.filter(product_id__in=product_ids),
+        keep,
+    )
 
     for item in items:
-        oid = _parse_uuid(item.get("id"))
-        pid = _parse_uuid(item.get("product_id"))
-        if not oid or not pid:
-            continue
-        product = Product.objects.filter(id=pid, model=m, deleted_at__isnull=True).first()
-        if not product:
-            continue
-        equipment_group = None
-        eid = _parse_uuid(item.get("equip_id"))
-        if eid:
-            equipment_group = EquipmentGroup.objects.filter(id=eid, model=m).first()
+        operation_id = _parse_uuid(item.get("id"))
 
-        fields = {
-            "organization": org,
-            "product": product,
-            "op_number": item.get("op_number", 1),
-            "name": item.get("op_name", ""),
-            "equipment_group": equipment_group,
-            "percent_assign": item.get("pct_assigned", 100),
-            "equipment_setup_per_lot": item.get("equip_setup_lot", 0),
-            "equipment_setup_per_piece": item.get("equip_setup_piece", 0),
-            "equipment_setup_per_tbatch": item.get("equip_setup_tbatch", 0),
-            "equipment_run_per_piece": item.get("equip_run_piece", 0),
-            "equipment_run_per_lot": item.get("equip_run_lot", 0),
-            "equipment_run_per_tbatch": item.get("equip_run_tbatch", 0),
-            "labor_setup_per_lot": item.get("labor_setup_lot", 0),
-            "labor_setup_per_piece": item.get("labor_setup_piece", 0),
-            "labor_setup_per_tbatch": item.get("labor_setup_tbatch", 0),
-            "labor_run_per_piece": item.get("labor_run_piece", 0),
-            "labor_run_per_lot": item.get("labor_run_lot", 0),
-            "labor_run_per_tbatch": item.get("labor_run_tbatch", 0),
-            "oper1": item.get("oper1", 0),
-            "oper2": item.get("oper2", 0),
-            "oper3": item.get("oper3", 0),
-            "oper4": item.get("oper4", 0),
-            "comments": "",
-            "deleted_at": None,
-        }
-        row = Operation.objects.filter(id=oid, product__model=m).first()
-        if row:
-            for key, val in fields.items():
-                setattr(row, key, val)
-            row.save()
-        else:
-            op_existing = Operation.objects.filter(id=oid).first()
-            if op_existing is not None:
-                raise SnapshotScopeError(f"Operation id {oid} does not belong to this model")
-            Operation.objects.create(id=oid, **fields)
+        if not operation_id:
+            continue
+
+        product = _operation_product(
+            m,
+            item,
+        )
+
+        if product is None:
+            continue
+
+        fields = _operation_fields(
+            m,
+            org,
+            product,
+            item,
+        )
+
+        _save_operation_row(
+            m,
+            operation_id,
+            fields,
+        )
+
+def _operation_keep_ids(items):
+    keep = set()
+
+    for item in items:
+        operation_id = _parse_uuid(item.get("id"))
+        if operation_id:
+            keep.add(operation_id)
+
+    return keep
+
+def _operation_product(model, item):
+    product_id = _parse_uuid(item.get("product_id"))
+
+    if not product_id:
+        return None
+
+    return Product.objects.filter(
+        id=product_id,
+        model=model,
+        deleted_at__isnull=True,
+    ).first()
+
+def _operation_equipment(model, item):
+    equipment_id = _parse_uuid(item.get("equip_id"))
+
+    if not equipment_id:
+        return None
+
+    return EquipmentGroup.objects.filter(
+        id=equipment_id,
+        model=model,
+    ).first()
+
+def _operation_fields(model, organization, product, item):
+    return {
+        "organization": organization,
+        "product": product,
+        "op_number": item.get("op_number", 1),
+        "name": item.get("op_name", ""),
+        "equipment_group": _operation_equipment(model, item),
+        "percent_assign": item.get("pct_assigned", 100),
+        "equipment_setup_per_lot": item.get("equip_setup_lot", 0),
+        "equipment_setup_per_piece": item.get("equip_setup_piece", 0),
+        "equipment_setup_per_tbatch": item.get("equip_setup_tbatch", 0),
+        "equipment_run_per_piece": item.get("equip_run_piece", 0),
+        "equipment_run_per_lot": item.get("equip_run_lot", 0),
+        "equipment_run_per_tbatch": item.get("equip_run_tbatch", 0),
+        "labor_setup_per_lot": item.get("labor_setup_lot", 0),
+        "labor_setup_per_piece": item.get("labor_setup_piece", 0),
+        "labor_setup_per_tbatch": item.get("labor_setup_tbatch", 0),
+        "labor_run_per_piece": item.get("labor_run_piece", 0),
+        "labor_run_per_lot": item.get("labor_run_lot", 0),
+        "labor_run_per_tbatch": item.get("labor_run_tbatch", 0),
+        "oper1": item.get("oper1", 0),
+        "oper2": item.get("oper2", 0),
+        "oper3": item.get("oper3", 0),
+        "oper4": item.get("oper4", 0),
+        "comments": "",
+        "deleted_at": None,
+    }
+
+def _save_operation_row(model, operation_id, fields):
+    row = Operation.objects.filter(
+        id=operation_id,
+        product__model=model,
+    ).first()
+
+    if row:
+        for key, value in fields.items():
+            setattr(row, key, value)
+        row.save()
+        return
+
+    existing = Operation.objects.filter(id=operation_id).first()
+
+    if existing is not None:
+        raise SnapshotScopeError(
+            f"Operation id {operation_id} does not belong to this model"
+        )
+
+    Operation.objects.create(
+        id=operation_id,
+        **fields,
+    )
+
 
 
 def _restore_routing(m: RMCMModel, org, items: list) -> None:
-    product_ids = list(Product.objects.filter(model=m).values_list("id", flat=True))
-    keep: set[uuid.UUID] = set()
-    for item in items:
-        rid = _parse_uuid(item.get("id"))
-        if rid:
-            keep.add(rid)
-    _soft_delete_extras(Routing.objects.filter(product_id__in=product_ids), keep)
+    product_ids = Product.objects.filter(
+        model=m,
+    ).values_list("id", flat=True)
+
+    keep = _routing_keep_ids(items)
+
+    _soft_delete_extras(
+        Routing.objects.filter(product_id__in=product_ids),
+        keep,
+    )
 
     for item in items:
-        rid = _parse_uuid(item.get("id"))
-        pid = _parse_uuid(item.get("product_id"))
-        if not rid or not pid:
+        routing_id = _parse_uuid(item.get("id"))
+
+        if not routing_id:
             continue
-        product = Product.objects.filter(id=pid, model=m, deleted_at__isnull=True).first()
-        if not product:
+
+        product = _routing_product(
+            m,
+            item,
+        )
+
+        if product is None:
             continue
-        from_name = item.get("from_op_name") or ""
-        to_name = item.get("to_op_name") or ""
-        from_op = Operation.objects.filter(
-            product=product, name=from_name, deleted_at__isnull=True
-        ).first()
-        to_op = Operation.objects.filter(
-            product=product, name=to_name, deleted_at__isnull=True
-        ).first()
-        if not from_op or not to_op:
+
+        from_operation, to_operation = _routing_operations(
+            product,
+            item,
+        )
+
+        if from_operation is None or to_operation is None:
             continue
-        fields = {
-            "organization": org,
-            "product": product,
-            "from_operation": from_op,
-            "to_operation": to_op,
-            "probability": item.get("pct_routed", 1),
-            "deleted_at": None,
-        }
-        row = Routing.objects.filter(id=rid, product__model=m).first()
-        if row:
-            for key, val in fields.items():
-                setattr(row, key, val)
-            row.save()
-        else:
-            existing = Routing.objects.filter(id=rid).first()
-            if existing is not None and existing.product.model_id != m.id:
-                raise SnapshotScopeError(f"Routing id {rid} does not belong to this model")
-            Routing.objects.create(id=rid, **fields)
+
+        fields = _routing_fields(
+            org,
+            product,
+            from_operation,
+            to_operation,
+            item,
+        )
+
+        _save_routing_row(
+            m,
+            routing_id,
+            fields,
+        )
+
+def _routing_keep_ids(items):
+    keep = set()
+
+    for item in items:
+        routing_id = _parse_uuid(item.get("id"))
+        if routing_id:
+            keep.add(routing_id)
+
+    return keep
+
+def _routing_product(model, item):
+    product_id = _parse_uuid(item.get("product_id"))
+
+    if not product_id:
+        return None
+
+    return Product.objects.filter(
+        id=product_id,
+        model=model,
+        deleted_at__isnull=True,
+    ).first()
+
+def _routing_operations(product, item):
+    from_operation = Operation.objects.filter(
+        product=product,
+        name=item.get("from_op_name") or "",
+        deleted_at__isnull=True,
+    ).first()
+
+    to_operation = Operation.objects.filter(
+        product=product,
+        name=item.get("to_op_name") or "",
+        deleted_at__isnull=True,
+    ).first()
+
+    return from_operation, to_operation
+
+def _routing_fields(org, product, from_operation, to_operation, item):
+    return {
+        "organization": org,
+        "product": product,
+        "from_operation": from_operation,
+        "to_operation": to_operation,
+        "probability": item.get("pct_routed", 1),
+        "deleted_at": None,
+    }
+
+def _save_routing_row(model, routing_id, fields):
+    row = Routing.objects.filter(
+        id=routing_id,
+        product__model=model,
+    ).first()
+
+    if row:
+        for key, value in fields.items():
+            setattr(row, key, value)
+        row.save()
+        return
+
+    existing = Routing.objects.filter(id=routing_id).first()
+
+    if existing is not None and existing.product.model_id != model.id:
+        raise SnapshotScopeError(
+            f"Routing id {routing_id} does not belong to this model"
+        )
+
+    Routing.objects.create(
+        id=routing_id,
+        **fields,
+    )
+
 
 
 def _restore_ibom(m: RMCMModel, org, items: list) -> None:
-    parent_ids = list(Product.objects.filter(model=m).values_list("id", flat=True))
-    keep: set[uuid.UUID] = set()
-    for item in items:
-        bid = _parse_uuid(item.get("id"))
-        if bid:
-            keep.add(bid)
-    _soft_delete_extras(BOM.objects.filter(parent_product_id__in=parent_ids), keep)
+    parent_ids = Product.objects.filter(
+        model=m,
+    ).values_list("id", flat=True)
+
+    keep = _ibom_keep_ids(items)
+
+    _soft_delete_extras(
+        BOM.objects.filter(parent_product_id__in=parent_ids),
+        keep,
+    )
 
     for item in items:
-        bid = _parse_uuid(item.get("id"))
-        parent_id = _parse_uuid(item.get("parent_product_id"))
-        component_id = _parse_uuid(item.get("component_product_id"))
-        if not bid or not parent_id or not component_id:
+        bom_id = _parse_uuid(item.get("id"))
+
+        if not bom_id:
             continue
-        parent = Product.objects.filter(id=parent_id, model=m, deleted_at__isnull=True).first()
-        component = Product.objects.filter(id=component_id, model=m, deleted_at__isnull=True).first()
-        if not parent or not component:
+
+        parent, component = _ibom_products(
+            m,
+            item,
+        )
+
+        if parent is None or component is None:
             continue
-        fields = {
-            "organization": org,
-            "parent_product": parent,
-            "component_product": component,
-            "quantity_per_assembly": item.get("units_per_assy", 1),
-            "deleted_at": None,
-        }
-        row = BOM.objects.filter(id=bid, parent_product__model=m).first()
-        if row:
-            for key, val in fields.items():
-                setattr(row, key, val)
-            row.save()
-        else:
-            existing = BOM.objects.filter(id=bid).first()
-            if existing is not None and existing.parent_product.model_id != m.id:
-                raise SnapshotScopeError(f"BOM id {bid} does not belong to this model")
-            BOM.objects.create(id=bid, **fields)
+
+        fields = _ibom_fields(
+            org,
+            parent,
+            component,
+            item,
+        )
+
+        _save_ibom_row(
+            m,
+            bom_id,
+            fields,
+        )
+
+def _ibom_keep_ids(items):
+    keep = set()
+
+    for item in items:
+        bom_id = _parse_uuid(item.get("id"))
+        if bom_id:
+            keep.add(bom_id)
+
+    return keep
+
+def _ibom_products(model, item):
+    parent_id = _parse_uuid(item.get("parent_product_id"))
+    component_id = _parse_uuid(item.get("component_product_id"))
+
+    if not parent_id or not component_id:
+        return None, None
+
+    parent = Product.objects.filter(
+        id=parent_id,
+        model=model,
+        deleted_at__isnull=True,
+    ).first()
+
+    component = Product.objects.filter(
+        id=component_id,
+        model=model,
+        deleted_at__isnull=True,
+    ).first()
+
+    return parent, component
+
+def _ibom_fields(org, parent, component, item):
+    return {
+        "organization": org,
+        "parent_product": parent,
+        "component_product": component,
+        "quantity_per_assembly": item.get("units_per_assy", 1),
+        "deleted_at": None,
+    }
+
+def _save_ibom_row(model, bom_id, fields):
+    row = BOM.objects.filter(
+        id=bom_id,
+        parent_product__model=model,
+    ).first()
+
+    if row:
+        for key, value in fields.items():
+            setattr(row, key, value)
+        row.save()
+        return
+
+    existing = BOM.objects.filter(id=bom_id).first()
+
+    if existing is not None and existing.parent_product.model_id != model.id:
+        raise SnapshotScopeError(
+            f"BOM id {bom_id} does not belong to this model"
+        )
+
+    BOM.objects.create(
+        id=bom_id,
+        **fields,
+    )
+
 
 
 @transaction.atomic

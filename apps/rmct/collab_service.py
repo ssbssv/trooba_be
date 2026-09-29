@@ -221,7 +221,7 @@ def _apply_product(
     elif column == "tbatch_size":
         p.transfer_batch = value
     elif column == "dept_code":
-        p.department_area = value or None
+        p.department_area = value or ""
     elif column == "demand_factor":
         p.demand_factor = value
     elif column == "lot_factor":
@@ -241,55 +241,123 @@ def _apply_product(
 
 
 def _apply_equipment(
-    *, model_id: str, org_id: str, row_id: str, column: str, value: Any
+    *,
+    model_id: str,
+    org_id: str,
+    row_id: str,
+    column: str,
+    value: Any,
 ) -> dict[str, Any] | None:
     if column not in ALLOWED_EQUIPMENT_FIELDS:
         return None
+
+    eq = _get_equipment(
+        model_id,
+        org_id,
+        row_id,
+    )
+
+    if eq is None:
+        return None
+
+    _apply_equipment_field(
+        eq,
+        model_id,
+        column,
+        value,
+    )
+
+    eq.save()
+
+    return _payload(
+        "equipment",
+        model_id,
+        row_id,
+        column,
+        value,
+        eq.updated_at,
+    )
+
+def _equipment_labor_group(model_id: str, value):
+    if not value:
+        return None
+
+    try:
+        return Labor.objects.get(
+            id=value,
+            model_id=model_id,
+        )
+    except Labor.DoesNotExist:
+        return None
+
+def _apply_equipment_field(
+    eq: EquipmentGroup,
+    model_id: str,
+    column: str,
+    value,
+):
+    field_map = {
+        "name": "name",
+        "count": "count",
+        "mttf": "mttf_minutes",
+        "mttr": "mttr_minutes",
+        "overtime_pct": "overtime_percent",
+        "setup_factor": "setup_factor",
+        "run_factor": "run_factor",
+        "var_factor": "variability_factor",
+        "comments": "comments",
+    }
+
+    if column in field_map:
+        setattr(eq, field_map[column], value)
+        return
+
+    if column == "dept_code":
+        eq.department_area = value or None
+        return
+
+    if column == "out_of_area":
+        eq.out_of_area_equipment = bool(value)
+        return
+
+    if column == "equip_type":
+        eq.equipment_type = (
+            "Delay"
+            if str(value or "standard").lower() == "delay"
+            else "Standard"
+        )
+        return
+
+    if column == "labor_group_id":
+        eq.labor_group = _equipment_labor_group(
+            model_id,
+            value,
+        )
+        return
+
+    if column in ("eq1", "eq2", "eq3", "eq4"):
+        setattr(eq, column, value)
+
+def _get_equipment(
+    model_id: str,
+    org_id: str,
+    row_id: str,
+):
     eq = EquipmentGroup.objects.filter(
-        id=row_id, model_id=model_id
+        id=row_id,
+        model_id=model_id,
     ).first()
+
     if not eq:
         return None
+
     if str(eq.organization_id) != str(org_id):
         sync_row_organization(eq, org_id)
+
     revive_soft_deleted(eq)
-    if column == "name":
-        eq.name = value
-    elif column == "count":
-        eq.count = value
-    elif column == "mttf":
-        eq.mttf_minutes = value
-    elif column == "mttr":
-        eq.mttr_minutes = value
-    elif column == "overtime_pct":
-        eq.overtime_percent = value
-    elif column == "dept_code":
-        eq.department_area = value or None
-    elif column == "out_of_area":
-        eq.out_of_area_equipment = bool(value)
-    elif column == "setup_factor":
-        eq.setup_factor = value
-    elif column == "run_factor":
-        eq.run_factor = value
-    elif column == "var_factor":
-        eq.variability_factor = value
-    elif column == "equip_type":
-        et = (str(value or "standard")).lower()
-        eq.equipment_type = "Delay" if et == "delay" else "Standard"
-    elif column == "labor_group_id":
-        if value:
-            try:
-                eq.labor_group = Labor.objects.get(id=value, model_id=model_id)
-            except Labor.DoesNotExist:
-                eq.labor_group = None
-        else:
-            eq.labor_group = None
-    elif column in ("eq1", "eq2", "eq3", "eq4"):
-        setattr(eq, column, value)
-    elif column == "comments":
-        eq.comments = value
-    eq.save()
-    return _payload("equipment", model_id, row_id, column, value, eq.updated_at)
+
+    return eq
+
 
 
 def _apply_labor(
@@ -311,7 +379,7 @@ def _apply_labor(
     elif column == "unavail_pct":
         labor.unavailability_percent = value
     elif column == "dept_code":
-        labor.department = value or None
+        labor.department = value or ""
     elif column == "setup_factor":
         labor.setup_factor = value
     elif column == "run_factor":
@@ -328,7 +396,7 @@ def _apply_labor(
     return _payload("labor", model_id, row_id, column, value, labor.updated_at)
 
 
-def _routing_to_operation(*, model: RMCMModel, product: Product, op_name: str, org_id: str) -> Operation | None:
+def _routing_to_operation(*, product: Product, op_name: str, org_id: str) -> Operation | None:
     name = str(op_name or "").strip()
     if not name:
         return None
@@ -361,7 +429,7 @@ def _routing_to_operation(*, model: RMCMModel, product: Product, op_name: str, o
 
 def _apply_routing(
     *, model_id: str, org_id: str, row_id: str, column: str, value: Any
-) -> dict[str, Any] | None:
+ ) -> dict[str, Any] | None:
     if column not in ALLOWED_ROUTING_COLUMNS:
         return None
     routing = (
@@ -385,7 +453,7 @@ def _apply_routing(
             return None
     elif column == "to_op_name":
         to_op = _routing_to_operation(
-            model=m, product=routing.product, op_name=str(value), org_id=org_id
+             product=routing.product, op_name=str(value), org_id=org_id
         )
         if not to_op:
             return None
@@ -429,17 +497,8 @@ def _apply_general(*, model_id: str, org_id: str, column: str, value: Any) -> di
     if not m:
         return None
     gd, _ = GeneralData.objects.get_or_create(model=m)
-    if column in (
-        "model_title",
-        "author",
-        "comments",
-        "ops_time_unit",
-        "mct_time_unit",
-        "prod_period_unit",
-    ):
-        setattr(gd, column, value)
-    elif column in ("conv1", "conv2", "util_limit", "var_equip", "var_labor", "var_prod", "gen1", "gen2", "gen3", "gen4"):
-        setattr(gd, column, value)
+    
+    setattr(gd, column, value)
     gd.save()
     return _payload("general", model_id, model_id, column, value, None)
 
@@ -451,7 +510,7 @@ def _payload(
     column: str,
     value: Any,
     updated_at,
-) -> dict[str, Any]:
+    ) -> dict[str, Any]:
     return {
         "entity": entity,
         "model_id": str(model_id),

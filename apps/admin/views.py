@@ -20,6 +20,10 @@ from apps.users.access import ORG_STATUS_ACTIVE, ORG_STATUS_FROZEN
 from apps.organizations.models import Organization, OrganizationMember
 from apps.organizations.emails import send_org_owner_welcome_email
 
+INVALID_JSON_ERROR = "Invalid JSON"
+USER_NOT_FOUND_ERROR = "User not found"
+MEMBER_NOT_FOUND_ERROR = "Member not found"
+
 from .auth import (
     admin_credentials_valid,
     clear_admin_session,
@@ -144,7 +148,7 @@ def _hard_delete_org_member(org: Organization, user_id: int) -> None:
     if org.owner_id == user_id:
         raise ValueError('Cannot delete organization owner. Delete the organization instead.')
     if not OrganizationMember.objects.filter(organization=org, user_id=user_id).exists():
-        raise LookupError('Member not found')
+        raise LookupError(MEMBER_NOT_FOUND_ERROR)
     OrganizationMember.objects.filter(organization=org, user_id=user_id).delete()
     if not OrganizationMember.objects.filter(user_id=user_id).exists():
         User.objects.filter(id=user_id).delete()
@@ -156,7 +160,7 @@ def _hard_delete_platform_user(user_id: int) -> None:
             'Cannot delete organization owner. Delete the organization or remove ownership first.',
         )
     if not UserProfile.objects.filter(user_id=user_id, deleted_at__isnull=True).exists():
-        raise LookupError('User not found')
+        raise LookupError(USER_NOT_FOUND_ERROR)
     OrganizationMember.objects.filter(user_id=user_id).delete()
     _hard_delete_users([user_id])
 
@@ -198,47 +202,159 @@ def _scenario_outputs(model: RMCMModel) -> list:
     return outputs
 
 
-def _issue_rows_from_results(results_data: dict, model_id: str, model_name: str, scenario_id: str, scenario_name: str) -> list:
+def _issue_rows_from_results(
+    results_data: dict,
+    model_id: str,
+    model_name: str,
+    scenario_id: str,
+    scenario_name: str,
+) -> list:
     """Flatten DLL/calc messages for admin error panel (raw + kind)."""
-    rows = []
-    errors_raw = results_data.get('errorsRaw') or []
-    errors = results_data.get('errors') or []
-    warnings = results_data.get('warnings') or []
-    over_limit = results_data.get('overLimitResources') or results_data.get('over_limit_resources') or []
 
-    def append(kind: str, dll_message: str, raw_line: str | None = None):
-        if not dll_message or not str(dll_message).strip():
-            return
-        rows.append({
-            'kind': kind,
-            'dll_message': str(dll_message).strip(),
-            'raw_line': raw_line,
-            'model_id': model_id,
-            'model_name': model_name,
-            'scenario_id': scenario_id,
-            'scenario_name': scenario_name,
-        })
+    rows = []
+
+    errors_raw = results_data.get("errorsRaw") or []
+    errors = results_data.get("errors") or []
+    warnings = results_data.get("warnings") or []
+    over_limit = (
+        results_data.get("overLimitResources")
+        or results_data.get("over_limit_resources")
+        or []
+    )
 
     if isinstance(errors_raw, list) and errors_raw:
-        for i, raw in enumerate(errors_raw):
-            raw_s = str(raw).strip()
-            if not raw_s:
-                continue
-            parsed = errors[i] if i < len(errors) else raw_s
-            kind = 'warning' if 'warning' in raw_s.lower()[:40] else 'error'
-            append(kind, str(parsed), raw_s)
-    else:
-        if isinstance(errors, list):
-            for err in errors:
-                append('error', str(err))
-        if isinstance(warnings, list):
-            for warn in warnings:
-                append('warning', str(warn))
-        if isinstance(over_limit, list):
-            for msg in over_limit:
-                append('warning', str(msg))
+        _append_raw_errors(
+            rows,
+            errors_raw,
+            errors,
+            model_id,
+            model_name,
+            scenario_id,
+            scenario_name,
+        )
+        return rows
+
+    if isinstance(errors, list):
+        _append_messages(
+            rows,
+            errors,
+            "error",
+            model_id,
+            model_name,
+            scenario_id,
+            scenario_name,
+        )
+
+    if isinstance(warnings, list):
+        _append_messages(
+            rows,
+            warnings,
+            "warning",
+            model_id,
+            model_name,
+            scenario_id,
+            scenario_name,
+        )
+
+    if isinstance(over_limit, list):
+        _append_messages(
+            rows,
+            over_limit,
+            "warning",
+            model_id,
+            model_name,
+            scenario_id,
+            scenario_name,
+        )
 
     return rows
+
+def _append_issue_row(
+    rows: list,
+    *,
+    kind: str,
+    dll_message: str,
+    raw_line: str | None,
+    model_id: str,
+    model_name: str,
+    scenario_id: str,
+    scenario_name: str,
+) -> None:
+    if not dll_message or not str(dll_message).strip():
+        return
+
+    rows.append(
+        {
+            "kind": kind,
+            "dll_message": str(dll_message).strip(),
+            "raw_line": raw_line,
+            "model_id": model_id,
+            "model_name": model_name,
+            "scenario_id": scenario_id,
+            "scenario_name": scenario_name,
+        }
+    )
+
+
+def _append_raw_errors(
+    rows: list,
+    errors_raw: list,
+    errors: list,
+    model_id: str,
+    model_name: str,
+    scenario_id: str,
+    scenario_name: str,
+) -> None:
+    for index, raw in enumerate(errors_raw):
+        raw_text = str(raw).strip()
+
+        if not raw_text:
+            continue
+
+        parsed = (
+            errors[index]
+            if index < len(errors)
+            else raw_text
+        )
+
+        kind = (
+            "warning"
+            if "warning" in raw_text.lower()[:40]
+            else "error"
+        )
+
+        _append_issue_row(
+            rows,
+            kind=kind,
+            dll_message=str(parsed),
+            raw_line=raw_text,
+            model_id=model_id,
+            model_name=model_name,
+            scenario_id=scenario_id,
+            scenario_name=scenario_name,
+        )
+
+def _append_messages(
+    rows: list,
+    messages: list,
+    kind: str,
+    model_id: str,
+    model_name: str,
+    scenario_id: str,
+    scenario_name: str,
+) -> None:
+    for message in messages:
+        _append_issue_row(
+            rows,
+            kind=kind,
+            dll_message=str(message),
+            raw_line=None,
+            model_id=model_id,
+            model_name=model_name,
+            scenario_id=scenario_id,
+            scenario_name=scenario_name,
+        )
+
 
 
 @csrf_exempt
@@ -246,7 +362,7 @@ def _issue_rows_from_results(results_data: dict, model_id: str, model_name: str,
 def admin_login(request):
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse({'error': INVALID_JSON_ERROR}, status=400)
 
     email = data.get('email') or ''
     password = data.get('password') or ''
@@ -318,7 +434,7 @@ def admin_delete_user(request, user_id: int):
     except ValueError as exc:
         return JsonResponse({'error': str(exc)}, status=400)
     except LookupError:
-        return JsonResponse({'error': 'User not found'}, status=404)
+        return JsonResponse({'error': USER_NOT_FOUND_ERROR}, status=404)
     return JsonResponse({'message': 'User deleted permanently'})
 
 
@@ -335,7 +451,7 @@ def admin_user_detail(request, user_id: int):
             deleted_at__isnull=True,
         )
     except UserProfile.DoesNotExist:
-        return JsonResponse({'error': 'User not found'}, status=404)
+        return JsonResponse({'error': USER_NOT_FOUND_ERROR}, status=404)
 
     models = RMCMModel.objects.filter(owner_id=profile.user_id).order_by('-updated_at')
     return JsonResponse({
@@ -354,7 +470,7 @@ def admin_model_detail(request, user_id: int, model_id: uuid.UUID):
     try:
         profile = UserProfile.objects.get(user_id=user_id, deleted_at__isnull=True)
     except UserProfile.DoesNotExist:
-        return JsonResponse({'error': 'User not found'}, status=404)
+        return JsonResponse({'error': USER_NOT_FOUND_ERROR}, status=404)
 
     model = get_object_or_404(
         RMCMModel.objects.prefetch_related('scenarios'),
@@ -447,7 +563,7 @@ def admin_create_organization_member(request, org_id: uuid.UUID):
 
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse({'error': INVALID_JSON_ERROR}, status=400)
 
     member_name = (data.get('member_name') or data.get('name') or '').strip()
     member_email = (data.get('member_email') or data.get('email') or '').strip().lower()
@@ -470,7 +586,7 @@ def admin_create_organization_member(request, org_id: uuid.UUID):
         first_name=member_name,
     )
 
-    profile = UserProfile.objects.create(
+    UserProfile.objects.create(
         user=user,
         full_name=member_name,
         organization=org,
@@ -556,7 +672,7 @@ def admin_user_credential(request, user_id: int):
             deleted_at__isnull=True,
         )
     except UserProfile.DoesNotExist:
-        return JsonResponse({'error': 'User not found'}, status=404)
+        return JsonResponse({'error': USER_NOT_FOUND_ERROR}, status=404)
 
     stored = profile.admin_stored_password or None
     return JsonResponse({
@@ -577,7 +693,7 @@ def admin_change_user_password(request, user_id: int):
 
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse({'error': INVALID_JSON_ERROR}, status=400)
 
     new_password = (data.get('new_password') or data.get('password') or '').strip()
     if len(new_password) < 8:
@@ -589,7 +705,7 @@ def admin_change_user_password(request, user_id: int):
             deleted_at__isnull=True,
         )
     except UserProfile.DoesNotExist:
-        return JsonResponse({'error': 'User not found'}, status=404)
+        return JsonResponse({'error': USER_NOT_FOUND_ERROR}, status=404)
 
     user = profile.user
     user.set_password(new_password)
@@ -614,110 +730,241 @@ def admin_change_user_password(request, user_id: int):
 
 
 @csrf_exempt
-@require_http_methods(['POST'])
+@require_http_methods(["POST"])
 def admin_create_organization(request):
-    """
-    Portal admin flow:
-    - create organization
-    - create owner user (if not exists)
-    - assign org_owner role
-    - add owner as OrganizationMember
-    - mark must_change_password=True (force change after temp password login)
-    """
     err = _require_admin(request)
     if err:
         return err
 
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse(
+            {"error": INVALID_JSON_ERROR},
+            status=400,
+        )
 
-    org_name = (data.get('organization_name') or data.get('name') or '').strip()
-    owner_name = (data.get('owner_name') or '').strip()
-    owner_email = (data.get('owner_email') or '').strip().lower()
-    temp_password = (data.get('temporary_password') or data.get('temp_password') or '').strip()
+    values, err = _validate_admin_create_request(data)
+    if err:
+        return err
+
+    org_code, slug = _organization_identifiers(
+        data,
+        values["org_name"],
+    )
+
+    err = _validate_unique_org(
+        org_code,
+        slug,
+    )
+    if err:
+        return err
+
+    user, err = _create_owner_user(values)
+    if err:
+        return err
+
+    organization = _create_organization(
+        request,
+        data,
+        values,
+        org_code,
+        slug,
+        user,
+    )
+
+    _configure_owner_profile(
+        user,
+        organization,
+        values,
+    )
+
+    OrganizationMember.objects.get_or_create(
+        organization=organization,
+        user=user,
+    )
+
+    login_url = _send_owner_welcome_email(
+        data,
+        values,
+    )
+
+    return JsonResponse(
+        {
+            "message": "Organization created",
+            "organization_id": str(organization.id),
+            "owner_user_id": user.id,
+            "owner_email": values["owner_email"],
+            "login_url": login_url,
+        },
+        status=201,
+    )
+
+def _validate_admin_create_request(data):
+    org_name = (data.get("organization_name") or data.get("name") or "").strip()
+    owner_name = (data.get("owner_name") or "").strip()
+    owner_email = (data.get("owner_email") or "").strip().lower()
+    temp_password = (
+        data.get("temporary_password")
+        or data.get("temp_password")
+        or ""
+    ).strip()
 
     if not org_name:
-        return JsonResponse({'error': 'organization_name is required'}, status=400)
-    if not owner_name:
-        return JsonResponse({'error': 'owner_name is required'}, status=400)
-    if not owner_email:
-        return JsonResponse({'error': 'owner_email is required'}, status=400)
-    if not temp_password or len(temp_password) < 8:
-        return JsonResponse({'error': 'temporary_password must be at least 8 characters'}, status=400)
-
-    suf = uuid.uuid4().hex[:10]
-    org_code = (data.get('organization_code') or f"ORG-{suf.upper()}").strip()
-    slug = (data.get('slug') or slugify(f"{org_name}-{suf}")[:90] or f"org-{suf}").strip()
-
-    if Organization.objects.filter(organization_code=org_code).exists():
-        return JsonResponse({'error': 'organization_code already exists'}, status=400)
-    if Organization.objects.filter(slug=slug).exists():
-        return JsonResponse({'error': 'slug already exists'}, status=400)
-
-    user = User.objects.filter(email__iexact=owner_email).first()
-    if user is None:
-        user = User.objects.create_user(
-            username=owner_email,
-            email=owner_email,
-            password=temp_password,
-            first_name=owner_name,
+        return None, JsonResponse(
+            {"error": "organization_name is required"},
+            status=400,
         )
-    else:
-        # If user exists, we don't reset their password silently.
-        # Portal admin should use invite flow for existing users.
-        return JsonResponse({'error': 'A user with this email already exists'}, status=400)
 
-    org = Organization.objects.create(
-        name=org_name,
+    if not owner_name:
+        return None, JsonResponse(
+            {"error": "owner_name is required"},
+            status=400,
+        )
+
+    if not owner_email:
+        return None, JsonResponse(
+            {"error": "owner_email is required"},
+            status=400,
+        )
+
+    if len(temp_password) < 8:
+        return None, JsonResponse(
+            {"error": "temporary_password must be at least 8 characters"},
+            status=400,
+        )
+
+    return {
+        "org_name": org_name,
+        "owner_name": owner_name,
+        "owner_email": owner_email,
+        "temp_password": temp_password,
+    }, None
+
+
+def _organization_identifiers(data, org_name):
+    suffix = uuid.uuid4().hex[:10]
+
+    org_code = (
+        data.get("organization_code")
+        or f"ORG-{suffix.upper()}"
+    ).strip()
+
+    slug = (
+        data.get("slug")
+        or slugify(f"{org_name}-{suffix}")[:90]
+        or f"org-{suffix}"
+    ).strip()
+
+    return org_code, slug
+
+def _validate_unique_org(org_code, slug):
+    if Organization.objects.filter(
+        organization_code=org_code
+    ).exists():
+        return JsonResponse(
+            {"error": "organization_code already exists"},
+            status=400,
+        )
+
+    if Organization.objects.filter(
+        slug=slug
+    ).exists():
+        return JsonResponse(
+            {"error": "slug already exists"},
+            status=400,
+        )
+
+    return None
+
+def _create_owner_user(values):
+    user = User.objects.filter(
+        email__iexact=values["owner_email"]
+    ).first()
+
+    if user is not None:
+        return (
+            None,
+            JsonResponse(
+                {
+                    "error": "A user with this email already exists",
+                },
+                status=400,
+            ),
+        )
+
+    user = User.objects.create_user(
+        username=values["owner_email"],
+        email=values["owner_email"],
+        password=values["temp_password"],
+        first_name=values["owner_name"],
+    )
+
+    return user, None
+
+def _create_organization(
+    request,
+    data,
+    values,
+    org_code,
+    slug,
+    user,
+):
+    return Organization.objects.create(
+        name=values["org_name"],
         organization_code=org_code,
         slug=slug,
         owner=user,
         created_by_admin_email=_admin_email(request),
-        status=int(data.get('status', 1) or 1),
-        plan_type=data.get('plan_type'),
-        contact_email=data.get('contact_email'),
-        contact_phone=data.get('contact_phone'),
-        country=data.get('country'),
-        timezone=data.get('timezone'),
+        status=int(data.get("status", 1) or 1),
+        plan_type=data.get("plan_type"),
+        contact_email=data.get("contact_email"),
+        contact_phone=data.get("contact_phone"),
+        country=data.get("country"),
+        timezone=data.get("timezone"),
     )
 
+def _configure_owner_profile(
+    user,
+    organization,
+    values,
+):
     profile, _ = UserProfile.objects.get_or_create(
         user=user,
         defaults={
-            'full_name': owner_name,
-            'organization': org,
-        }
+            "full_name": values["owner_name"],
+            "organization": organization,
+        },
     )
-    profile.organization = org
-    profile.full_name = profile.full_name or owner_name
-    profile.role = 'org_owner'
+
+    profile.organization = organization
+    profile.full_name = (
+        profile.full_name
+        or values["owner_name"]
+    )
+    profile.role = "org_owner"
     profile.must_change_password = True
-    profile.admin_stored_password = temp_password
+    profile.admin_stored_password = values["temp_password"]
     profile.save()
 
-    OrganizationMember.objects.get_or_create(organization=org, user=user)
+def _send_owner_welcome_email(
+    data,
+    values,
+):
+    login_url = (data.get("login_url") or "").strip()
 
-    login_url = (data.get('login_url') or '').strip()
     if not login_url:
-        # frontend can override; default to the standard login route
         login_url = "/login"
 
     send_org_owner_welcome_email(
-        to_email=owner_email,
-        owner_name=owner_name,
-        organization_name=org_name,
-        temporary_password=temp_password,
+        to_email=values["owner_email"],
+        owner_name=values["owner_name"],
+        organization_name=values["org_name"],
+        temporary_password=values["temp_password"],
         login_url=login_url,
     )
 
-    return JsonResponse({
-        'message': 'Organization created',
-        'organization_id': str(org.id),
-        'owner_user_id': user.id,
-        'owner_email': owner_email,
-        'login_url': login_url,
-    }, status=201)
+    return login_url
+
 
 
 @csrf_exempt
@@ -780,7 +1027,7 @@ def admin_delete_organization_member(request, org_id: uuid.UUID, user_id: int):
     except ValueError as exc:
         return JsonResponse({'error': str(exc)}, status=400)
     except LookupError:
-        return JsonResponse({'error': 'Member not found'}, status=404)
+        return JsonResponse({'error': MEMBER_NOT_FOUND_ERROR}, status=404)
     return JsonResponse({'message': 'Member deleted permanently'})
 
 
@@ -792,7 +1039,7 @@ def admin_deactivate_organization_member(request, org_id: uuid.UUID, user_id: in
         return err
     org = _get_org_or_404(str(org_id))
     if not OrganizationMember.objects.filter(organization=org, user_id=user_id).exists():
-        return JsonResponse({'error': 'Member not found'}, status=404)
+        return JsonResponse({'error': MEMBER_NOT_FOUND_ERROR}, status=404)
     user = get_object_or_404(User, id=user_id)
     user.is_active = False
     user.save(update_fields=['is_active'])
@@ -816,7 +1063,7 @@ def admin_activate_organization_member(request, org_id: uuid.UUID, user_id: int)
             status=400,
         )
     if not OrganizationMember.objects.filter(organization=org, user_id=user_id).exists():
-        return JsonResponse({'error': 'Member not found'}, status=404)
+        return JsonResponse({'error': MEMBER_NOT_FOUND_ERROR}, status=404)
     user = get_object_or_404(User, id=user_id)
     user.is_active = True
     user.save(update_fields=['is_active'])

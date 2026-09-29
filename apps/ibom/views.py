@@ -9,7 +9,7 @@ from apps.rmct.models import RMCMModel
 from apps.products.models import Product
 
 from .models import BOM
-
+INVALID_JSON_ERROR = 'Invalid JSON'
 
 def _parse_json(request):
     try:
@@ -24,7 +24,7 @@ def model_ibom_create(request, model_id):
     m = get_object_or_404(RMCMModel, id=model_id)
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse({'error': INVALID_JSON_ERROR}, status=400)
 
     owner = m.owner
     if owner is None or not hasattr(owner, "profile") or not getattr(owner.profile, "organization_id", None):
@@ -61,7 +61,7 @@ def model_ibom_set_for_parent(request, model_id, parent_id):
     m = get_object_or_404(RMCMModel, id=model_id)
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse({'error': INVALID_JSON_ERROR}, status=400)
 
     owner = m.owner
     if owner is None or not hasattr(owner, "profile") or not getattr(owner.profile, "organization_id", None):
@@ -115,7 +115,7 @@ def model_ibom_update(request, model_id, entry_id):
     get_object_or_404(RMCMModel, id=model_id)
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        return JsonResponse({'error': INVALID_JSON_ERROR}, status=400)
 
     b = get_object_or_404(BOM, id=entry_id)
 

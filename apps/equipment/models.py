@@ -43,7 +43,7 @@ class EquipmentGroup(models.Model):
         related_name="equipment_groups"
     )
 
-    comments = models.TextField(null=True, blank=True)
+    comments = models.TextField( blank=True)
 
     equipment_type = models.CharField(
         max_length=50,
@@ -58,8 +58,8 @@ class EquipmentGroup(models.Model):
 
     department_area = models.CharField(
         max_length=255,
+        blank=True,
         null=True,
-        blank=True
     )
 
     out_of_area_equipment = models.BooleanField(default=False)

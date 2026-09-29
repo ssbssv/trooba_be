@@ -36,6 +36,7 @@ urlpatterns = [
     path("api/", include("apps.operations.urls")),
     path("api/", include("apps.routing.urls")),
     path("api/", include("apps.ibom.urls")),
+    path("api/ai/", include("apps.ai.urls")),
     path("api/organizations/", include("apps.organizations.urls")),
     path("", include("apps.admin.urls")),
     # Lightweight simulation endpoint that uses the formula helpers in

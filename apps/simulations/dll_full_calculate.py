@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-
+import math
 from standalone_dll_json_runner import run_model_from_json
-
+results_err="results.err"
 # # Dump DLL outputs on every full-calculate triggered run (can be disabled explicitly).
 # # Set `RMCT_DUMP_DLL_OUTPUTS=0` to disable.
 # _dump_env = os.environ.get("RMCT_DUMP_DLL_OUTPUTS", "").strip().lower()
@@ -93,7 +93,7 @@ from standalone_dll_json_runner import run_model_from_json
 #         encoding="utf-8",
 #     )
 
-#     return str(run_dir)
+
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -158,7 +158,7 @@ def _parse_results_err_row(row: str) -> Tuple[str, bool]:
             break
 
     if not message:
-        match = re.search(r"In Calculations,\s*(.+?)(?:,\s*\d+\s*,|$)", clean, re.IGNORECASE)
+        match = re.search(r"In Calculations,\s*([^,]+)(?:,\s*\d+\s*,|$)", clean, re.IGNORECASE)
         if match:
             message = match.group(1).strip(" -")
 
@@ -210,23 +210,18 @@ def _safe_preview(path: Path, max_lines: int = 8) -> List[str]:
     return preview
 
 
-def _persist_failure_artifacts(temp_dir: Path) -> Optional[str]:
+def _persist_failure_artifacts() -> Optional[str]:
     # Disabled: do not persist DLL failure artifacts to backend/tmp.
     return None
 
 
-def _persist_input_debug_artifacts(
-    model_from_db: Dict[str, Any],
-    model_after_scenario: Dict[str, Any],
-    model_for_dll_contract: Dict[str, Any],
-    dll_payload: Dict[str, Any],
-) -> Optional[str]:
+def _persist_input_debug_artifacts() -> Optional[str]:
     # Disabled: do not persist DLL input debug artifacts to backend/tmp.
     return None
 
 
 def _sanitize(value: float) -> float:
-    if value != value or value in (float("inf"), float("-inf")):
+    if  value in (float("inf"), float("-inf")):
         return 0.0
     return value
 
@@ -247,180 +242,499 @@ def _convert_model_to_mpx_contract(model: Dict[str, Any]) -> Dict[str, Any]:
     Mirrors the user's CSV->JSON shape (labor-*, equip-*, prod-* ids and fields).
     """
     general = deepcopy(model.get("general") or {})
-    labor_src = deepcopy(model.get("labor") or [])
-    equip_src = deepcopy(model.get("equipment") or [])
-    prod_src = deepcopy(model.get("products") or [])
-    oper_src = deepcopy(model.get("operations") or [])
-    route_src = deepcopy(model.get("routing") or [])
-    ibom_src = deepcopy(model.get("ibom") or [])
 
+    labor_out, labor_id_map = _convert_labor_rows(
+        model.get("labor") or [],
+    )
+
+    equipment_out, equip_id_map = _convert_equipment_rows(
+        model.get("equipment") or [],
+        labor_id_map,
+    )
+
+    # These will be implemented in Part 2 & 3
+    products_out, prod_id_map = _convert_product_rows(
+        model.get("products") or [],
+    )
+
+    operations_out = _convert_operation_rows(
+        model.get("operations") or [],
+        prod_id_map,
+        equip_id_map,
+    )
+
+    routing_out = _convert_routing_rows(
+        model.get("routing") or [],
+        prod_id_map,
+    )
+
+    ibom_out = _convert_ibom_rows(
+        model.get("ibom") or [],
+        prod_id_map,
+    )
+
+    return {
+        "general": general,
+        "labor": labor_out,
+        "equipment": equipment_out,
+        "products": products_out,
+        "operations": operations_out,
+        "routing": routing_out,
+        "ibom": ibom_out,
+    }
+
+def _convert_labor_rows(
+    labor_rows: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
     labor_id_map: Dict[str, str] = {}
     labor_out: List[Dict[str, Any]] = []
-    for idx, row in enumerate(labor_src, start=1):
+
+    for index, row in enumerate(labor_rows, start=1):
         old_id = str(row.get("id") or "")
-        new_id = f"labor-{idx}"
+        new_id = f"labor-{index}"
+
         labor_id_map[old_id] = new_id
+
         labor_out.append(
             {
                 "id": new_id,
                 "name": str(row.get("name") or "").strip(),
                 "count": _to_float(row.get("count"), 1.0),
-                "overtime_pct": _to_float(row.get("overtime_pct"), 0.0),
-                "unavail_pct": _to_float(row.get("unavail_pct"), 0.0),
-                "setup_factor": _to_float(row.get("setup_factor"), 1.0),
-                "run_factor": _to_float(row.get("run_factor"), 1.0),
-                "var_factor": _to_float(row.get("var_factor"), 1.0),
-                "flag": _to_int(row.get("flag"), 0),
+                "overtime_pct": _to_float(
+                    row.get("overtime_pct"),
+                    0.0,
+                ),
+                "unavail_pct": _to_float(
+                    row.get("unavail_pct"),
+                    0.0,
+                ),
+                "setup_factor": _to_float(
+                    row.get("setup_factor"),
+                    1.0,
+                ),
+                "run_factor": _to_float(
+                    row.get("run_factor"),
+                    1.0,
+                ),
+                "var_factor": _to_float(
+                    row.get("var_factor"),
+                    1.0,
+                ),
+                "flag": _to_int(
+                    row.get("flag"),
+                    0,
+                ),
             }
         )
 
+    return labor_out, labor_id_map
+
+def _convert_equipment_rows(
+    equipment_rows: List[Dict[str, Any]],
+    labor_id_map: Dict[str, str],
+) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
     equip_id_map: Dict[str, str] = {}
     equip_out: List[Dict[str, Any]] = []
-    for idx, row in enumerate(equip_src, start=1):
+
+    for index, row in enumerate(equipment_rows, start=1):
         old_id = str(row.get("id") or "")
-        new_id = f"equip-{idx}"
+        new_id = f"equip-{index}"
+
         equip_id_map[old_id] = new_id
-        src_labor_id = str(row.get("labor_group_id") or "")
+
+        src_labor_id = str(
+            row.get("labor_group_id") or ""
+        )
+
         equip_out.append(
             {
                 "id": new_id,
                 "name": str(row.get("name") or "").strip(),
-                "equip_type": str(row.get("equip_type") or "standard"),
-                "count": _to_int(row.get("count"), 1),
-                "mttf": _to_float(row.get("mttf"), 1.0),
-                "mttr": _to_float(row.get("mttr"), 1.0),
-                "overtime_pct": _to_float(row.get("overtime_pct"), 0.0),
-                "labor_group_id": labor_id_map.get(src_labor_id, "labor-0"),
-                "setup_factor": _to_float(row.get("setup_factor"), 1.0),
-                "run_factor": _to_float(row.get("run_factor"), 1.0),
-                "var_factor": _to_float(row.get("var_factor"), 1.0),
+                "equip_type": str(
+                    row.get("equip_type") or "standard"
+                ),
+                "count": _to_int(
+                    row.get("count"),
+                    1,
+                ),
+                "mttf": _to_float(
+                    row.get("mttf"),
+                    1.0,
+                ),
+                "mttr": _to_float(
+                    row.get("mttr"),
+                    1.0,
+                ),
+                "overtime_pct": _to_float(
+                    row.get("overtime_pct"),
+                    0.0,
+                ),
+                "labor_group_id": labor_id_map.get(
+                    src_labor_id,
+                    "labor-0",
+                ),
+                "setup_factor": _to_float(
+                    row.get("setup_factor"),
+                    1.0,
+                ),
+                "run_factor": _to_float(
+                    row.get("run_factor"),
+                    1.0,
+                ),
+                "var_factor": _to_float(
+                    row.get("var_factor"),
+                    1.0,
+                ),
                 # Per requirement: send 0 when true, else -1.
-                "cell_id": 0 if _to_bool(row.get("cell_id")) else -1,
+                "cell_id": (
+                    0
+                    if _to_bool(row.get("cell_id"))
+                    else -1
+                ),
             }
         )
 
+    return equip_out, equip_id_map
+
+def _convert_product_rows(
+    product_rows: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
     prod_id_map: Dict[str, str] = {}
     prod_out: List[Dict[str, Any]] = []
-    for idx, row in enumerate(prod_src, start=1):
+
+    for index, row in enumerate(product_rows, start=1):
         old_id = str(row.get("id") or "")
-        new_id = f"prod-{idx}"
+        new_id = f"prod-{index}"
+
         prod_id_map[old_id] = new_id
-        tbatch = _to_float(row.get("tbatch_size"), 1.0)
+
+
+
         # Preserve -1 sentinel (means "use lot size") for DLL payload.
         # Any other non-positive value is coerced to 1.0.
-        tbatch_mapped = -1.0 if tbatch == -1.0 else (tbatch if tbatch > 0 else 1.0)
+        tbatch = _to_float(
+            row.get("tbatch_size"),
+            1.0,
+        )
+
+        if tbatch == -1.0:
+            tbatch_mapped = -1.0
+        elif tbatch > 0:
+            tbatch_mapped = tbatch
+        else:
+            tbatch_mapped = 1.0
+
         prod_out.append(
             {
                 "id": new_id,
                 "name": str(row.get("name") or "").strip(),
-                "demand": max(_to_float(row.get("demand"), 0.0), 0.0),
-                "lot_size": max(_to_float(row.get("lot_size"), 1.0), 1.0),
+                "demand": max(
+                    _to_float(
+                        row.get("demand"),
+                        0.0,
+                    ),
+                    0.0,
+                ),
+                "lot_size": max(
+                    _to_float(
+                        row.get("lot_size"),
+                        1.0,
+                    ),
+                    1.0,
+                ),
                 "tbatch_size": tbatch_mapped,
-                "setup_factor": _to_float(row.get("setup_factor"), 1.0),
-                "var_factor": _to_float(row.get("var_factor"), 1.0),
-                "tbatch_gather": _to_int(row.get("tbatch_gather", row.get("gather_tbatches")), 0),
-                "flag": _to_int(row.get("flag"), 1),
+                "setup_factor": _to_float(
+                    row.get("setup_factor"),
+                    1.0,
+                ),
+                "var_factor": _to_float(
+                    row.get("var_factor"),
+                    1.0,
+                ),
+                "tbatch_gather": _to_int(
+                    row.get(
+                        "tbatch_gather",
+                        row.get("gather_tbatches"),
+                    ),
+                    0,
+                ),
+                "flag": _to_int(
+                    row.get("flag"),
+                    1,
+                ),
             }
         )
 
+    return prod_out, prod_id_map
+
+def _convert_operation_rows(
+    operation_rows: List[Dict[str, Any]],
+    prod_id_map: Dict[str, str],
+    equip_id_map: Dict[str, str],
+) -> List[Dict[str, Any]]:
     oper_out: List[Dict[str, Any]] = []
-    for row in oper_src:
+
+    for row in operation_rows:
         src_pid = str(row.get("product_id") or "")
         src_eid = str(row.get("equip_id") or "")
-        op_name = str(row.get("op_name") or "").strip().upper()
+
+        op_name = str(
+            row.get("op_name") or ""
+        ).strip().upper()
+
         is_meta = op_name in _ROUTING_META
+
         oper_out.append(
             {
-                "product_id": prod_id_map.get(src_pid, src_pid),
+                "product_id": prod_id_map.get(
+                    src_pid,
+                    src_pid,
+                ),
                 "op_name": op_name,
-                "op_number": _to_int(row.get("op_number"), 0),
-                "equip_id": "" if is_meta else equip_id_map.get(src_eid, ""),
-                "pct_assigned": _to_float(row.get("pct_assigned"), 100.0),
-                "equip_setup_lot": _to_float(row.get("equip_setup_lot"), 0.0),
-                "equip_setup_tbatch": _to_float(row.get("equip_setup_tbatch"), 0.0),
-                "equip_setup_piece": _to_float(row.get("equip_setup_piece"), 0.0),
-                "equip_run_lot": _to_float(row.get("equip_run_lot"), 0.0),
-                "equip_run_tbatch": _to_float(row.get("equip_run_tbatch"), 0.0),
-                "equip_run_piece": _to_float(row.get("equip_run_piece"), 0.0),
-                "labor_setup_lot": _to_float(row.get("labor_setup_lot"), 0.0),
-                "labor_setup_tbatch": _to_float(row.get("labor_setup_tbatch"), 0.0),
-                "labor_setup_piece": _to_float(row.get("labor_setup_piece"), 0.0),
-                "labor_run_lot": _to_float(row.get("labor_run_lot"), 0.0),
-                "labor_run_tbatch": _to_float(row.get("labor_run_tbatch"), 0.0),
-                "labor_run_piece": _to_float(row.get("labor_run_piece"), 0.0),
-                "flag": _to_int(row.get("flag"), 0),
+                "op_number": _to_int(
+                    row.get("op_number"),
+                    0,
+                ),
+                "equip_id": (
+                    ""
+                    if is_meta
+                    else equip_id_map.get(
+                        src_eid,
+                        "",
+                    )
+                ),
+                "pct_assigned": _to_float(
+                    row.get("pct_assigned"),
+                    100.0,
+                ),
+                "equip_setup_lot": _to_float(
+                    row.get("equip_setup_lot"),
+                    0.0,
+                ),
+                "equip_setup_tbatch": _to_float(
+                    row.get("equip_setup_tbatch"),
+                    0.0,
+                ),
+                "equip_setup_piece": _to_float(
+                    row.get("equip_setup_piece"),
+                    0.0,
+                ),
+                "equip_run_lot": _to_float(
+                    row.get("equip_run_lot"),
+                    0.0,
+                ),
+                "equip_run_tbatch": _to_float(
+                    row.get("equip_run_tbatch"),
+                    0.0,
+                ),
+                "equip_run_piece": _to_float(
+                    row.get("equip_run_piece"),
+                    0.0,
+                ),
+                "labor_setup_lot": _to_float(
+                    row.get("labor_setup_lot"),
+                    0.0,
+                ),
+                "labor_setup_tbatch": _to_float(
+                    row.get("labor_setup_tbatch"),
+                    0.0,
+                ),
+                "labor_setup_piece": _to_float(
+                    row.get("labor_setup_piece"),
+                    0.0,
+                ),
+                "labor_run_lot": _to_float(
+                    row.get("labor_run_lot"),
+                    0.0,
+                ),
+                "labor_run_tbatch": _to_float(
+                    row.get("labor_run_tbatch"),
+                    0.0,
+                ),
+                "labor_run_piece": _to_float(
+                    row.get("labor_run_piece"),
+                    0.0,
+                ),
+                "flag": _to_int(
+                    row.get("flag"),
+                    0,
+                ),
             }
         )
 
+    return oper_out
+
+def _convert_routing_rows(
+    routing_rows: List[Dict[str, Any]],
+    prod_id_map: Dict[str, str],
+) -> List[Dict[str, Any]]:
     route_out: List[Dict[str, Any]] = []
-    for row in route_src:
+
+    for row in routing_rows:
         src_pid = str(row.get("product_id") or "")
+
         route_out.append(
             {
-                "product_id": prod_id_map.get(src_pid, src_pid),
-                "from_op_name": str(row.get("from_op_name") or "").strip().upper(),
-                "to_op_name": str(row.get("to_op_name") or "").strip().upper(),
-                "pct_routed": _to_float(row.get("pct_routed"), 0.0),
+                "product_id": prod_id_map.get(
+                    src_pid,
+                    src_pid,
+                ),
+                "from_op_name": str(
+                    row.get("from_op_name") or ""
+                ).strip().upper(),
+                "to_op_name": str(
+                    row.get("to_op_name") or ""
+                ).strip().upper(),
+                "pct_routed": _to_float(
+                    row.get("pct_routed"),
+                    0.0,
+                ),
             }
         )
 
+    return route_out
+
+def _convert_ibom_rows(
+    ibom_rows: List[Dict[str, Any]],
+    prod_id_map: Dict[str, str],
+) -> List[Dict[str, Any]]:
     ibom_out: List[Dict[str, Any]] = []
-    for row in ibom_src:
-        parent_src = str(row.get("parent_product_id") or "")
-        comp_src = str(row.get("component_product_id") or "")
+
+    for row in ibom_rows:
+        parent_src = str(
+            row.get("parent_product_id") or ""
+        )
+        component_src = str(
+            row.get("component_product_id") or ""
+        )
+
         ibom_out.append(
             {
-                "parent_product_id": prod_id_map.get(parent_src, parent_src),
-                "component_product_id": prod_id_map.get(comp_src, comp_src),
-                "units_per_assy": _to_float(row.get("units_per_assy"), 0.0),
+                "parent_product_id": prod_id_map.get(
+                    parent_src,
+                    parent_src,
+                ),
+                "component_product_id": prod_id_map.get(
+                    component_src,
+                    component_src,
+                ),
+                "units_per_assy": _to_float(
+                    row.get("units_per_assy"),
+                    0.0,
+                ),
             }
         )
 
-    return {
-        "general": general,
-        "labor": labor_out,
-        "equipment": equip_out,
-        "products": prod_out,
-        "operations": oper_out,
-        "routing": route_out,
-        "ibom": ibom_out,
-    }
+    return ibom_out
 
 
-def _apply_scenario(model: Dict[str, Any], scenario: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _apply_scenario(
+    model: Dict[str, Any],
+    scenario: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
     if not scenario or not scenario.get("changes"):
         return deepcopy(model)
 
     result = deepcopy(model)
+
     for change in scenario.get("changes", []):
         data_type = change.get("dataType")
         entity_id = change.get("entityId")
         field = change.get("field")
         value = change.get("whatIfValue")
 
-        target_list = {
-            "Labor": "labor",
-            "Equipment": "equipment",
-            "Product": "products",
-            "Routing": "routing",
-        }.get(data_type)
+        target_list = _scenario_target_list(data_type)
 
-        if target_list:
-            for item in result.get(target_list, []):
-                if item.get("id") == entity_id:
-                    if data_type == "Product" and field == "included" and str(value).lower() == "false":
-                        item["demand"] = 0
-                    elif data_type == "Routing":
-                        item[field] = _to_float(value, 0.0) if value is not None else 0.0
-                    else:
-                        item[field] = value
-                    break
-        elif data_type == "Product Inclusion" and str(value).lower() in {"no", "false"}:
-            for product in result.get("products", []):
-                if product.get("id") == entity_id:
-                    product["demand"] = 0
-                    break
+        if target_list is not None:
+            item = _find_entity(
+                result.get(target_list, []),
+                entity_id,
+            )
+
+            if item is not None:
+                _apply_standard_change(
+                    item,
+                    data_type,
+                    field,
+                    value,
+                )
+            elif data_type == "Routing":
+                # What-if operation edits use dataType "Routing" with operation ids.
+                operation = _find_entity(
+                    result.get("operations", []),
+                    entity_id,
+                )
+                if operation is not None and field:
+                    _apply_standard_change(
+                        operation,
+                        data_type,
+                        field,
+                        value,
+                    )
+
+            continue
+
+        if (
+            data_type == "Product Inclusion"
+            and str(value).lower() in {"no", "false"}
+        ):
+            _apply_product_inclusion(
+                result.get("products", []),
+                entity_id,
+            )
+
     return result
+
+def _scenario_target_list(data_type: str) -> str | None:
+    return {
+        "Labor": "labor",
+        "Equipment": "equipment",
+        "Product": "products",
+        "Routing": "routing",
+    }.get(data_type)
+
+def _find_entity(items: list[dict[str, Any]], entity_id: Any) -> dict[str, Any] | None:
+    for item in items:
+        if item.get("id") == entity_id:
+            return item
+    return None
+
+def _apply_standard_change(
+    item: dict[str, Any],
+    data_type: str,
+    field: str,
+    value: Any,
+) -> None:
+    if (
+        data_type == "Product"
+        and field == "included"
+        and str(value).lower() == "false"
+    ):
+        item["demand"] = 0
+        return
+
+    if data_type == "Routing":
+        item[field] = (
+            _to_float(value, 0.0)
+            if value is not None
+            else 0.0
+        )
+        return
+
+    item[field] = value
+
+def _apply_product_inclusion(
+    products: list[dict[str, Any]],
+    entity_id: Any,
+) -> None:
+    product = _find_entity(
+        products,
+        entity_id,
+    )
+
+    if product is not None:
+        product["demand"] = 0
+
 
 
 def _coerce_route_pct(value: Any) -> float:
@@ -487,6 +801,52 @@ def normalize_routing_rows_for_dll(raw: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_valid_routing_payload(raw: Any) -> bool:
+    return isinstance(raw, list) and bool(raw)
+
+def _append_nested_routing_rows(
+    out: list[dict[str, Any]],
+    item: dict[str, Any],
+) -> None:
+    pid = _first_present(
+        item,
+        ("product_id", "productId"),
+    )
+
+    if pid is None:
+        return
+
+    entries = item.get("entries") or []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        merged = {
+            **entry,
+            "product_id": pid,
+        }
+
+        row = _coerce_single_routing_row(merged)
+
+        if row is not None:
+            out.append(row)
+
+def _append_routing_row(
+    out: list[dict[str, Any]],
+    item: dict[str, Any],
+) -> None:
+    row = _coerce_single_routing_row(item)
+
+    if row is not None:
+        out.append(row)
+
+def _has_nested_entries(item: dict[str, Any]) -> bool:
+    entries = item.get("entries")
+    return isinstance(entries, list)
+
+
+
 _ROUTING_META = frozenset({"DOCK", "STOCK", "SCRAP"})
 
 
@@ -547,11 +907,9 @@ def normalize_operations_for_dll(
     Canonicalize operation rows to test4.json-style payload expected by the DLL.
     Ensures each product has DOCK/STOCK/SCRAP and stable op_number semantics.
     """
-    default_equip_id = ""
-    if isinstance(equipment, list) and equipment:
-        first = equipment[0]
-        if isinstance(first, dict):
-            default_equip_id = str(first.get("id") or "")
+    
+   
+
 
     def _op_row(pid: str, name: str, op_number: int, src: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         src = src or {}
@@ -695,6 +1053,14 @@ def _first_real_operation_name(operations: Any, product_id: str) -> Optional[str
     real.sort(key=lambda op: (_to_int(op.get("op_number"), 10**9), str(op.get("op_name", ""))))
     return str(real[0].get("op_name", "")).strip()
 
+def _get_sink_operation(op_names: set[str]) -> str | None:
+    if "SCRAP" in op_names:
+        return "SCRAP"
+
+    if "STOCK" in op_names:
+        return "STOCK"
+
+    return None
 
 def repair_routing_for_dll(
     products: Any,
@@ -745,7 +1111,7 @@ def repair_routing_for_dll(
             if remainder <= 0:
                 continue
             op_names = op_names_by_pid.get(pid, set())
-            sink_u = "SCRAP" if "SCRAP" in op_names else ("STOCK" if "STOCK" in op_names else None)
+            sink_u = _get_sink_operation(op_names)
             if not sink_u or frm_u == sink_u:
                 continue
             from_display = str(group[0].get("from_op_name", "")).strip() or frm_u
@@ -766,7 +1132,7 @@ def repair_routing_for_dll(
             groups[(pid, frm_u)].append(r)
     for pid in product_ids:
         op_names = op_names_by_pid.get(pid, set())
-        sink_u = "STOCK" if "STOCK" in op_names else ("SCRAP" if "SCRAP" in op_names else None)
+        sink_u = _get_sink_operation(op_names)
         if not sink_u:
             continue
         for frm_u in op_names:
@@ -1093,7 +1459,7 @@ def _parse_dll_outputs(model: Dict[str, Any], output_dir: Path) -> Dict[str, Any
     labor_rows = _read_csv_rows(output_dir / "results.lab")
     product_rows = _read_csv_rows(output_dir / "results.prt")
     operation_rows = _read_csv_rows(output_dir / "results.opr")
-    err_errors, err_warnings, err_raw = _read_results_err(output_dir / "results.err")
+    err_errors, err_warnings, err_raw = _read_results_err(output_dir / results_err)
 
     # Payload prepends one dummy labor + equipment row for DLL contract.
     equipment_results = _build_equipment_results(model, equipment_rows, index_offset=1)
@@ -1112,7 +1478,11 @@ def _parse_dll_outputs(model: Dict[str, Any], output_dir: Path) -> Dict[str, Any
         lid = str(lab.get("id") or "")
         linked = eq_by_labor.get(lid, [])
         has_direct_labor_cols = any(
-            _to_float(lab.get(k), 0.0) != 0.0
+            not math.isclose(
+                _to_float(lab.get(k), 0.0),
+                0.0,
+                abs_tol=1e-9,
+            )
             for k in ("machinesTended", "machinesWaiting", "avgWaitLaborUtil")
         )
         if has_direct_labor_cols:
@@ -1227,7 +1597,7 @@ def _is_system_warning_message(message: str) -> bool:
         "dll ",
         "dll:",
         "internal error",
-        "results.err",
+        results_err,
         "routing solver",
         "non-zero code",
         "status code",
@@ -1235,6 +1605,21 @@ def _is_system_warning_message(message: str) -> bool:
     )
     return any(marker in msg for marker in system_markers)
 
+def _retry_reason(
+    fatal_error_rows,
+    parsed_errors,
+    over_limit_resources,
+    ) -> str:
+    if fatal_error_rows:
+        return "fatal_results_err_row"
+
+    if parsed_errors:
+        return "results_err_rows_present"
+
+    if over_limit_resources:
+        return "over_limit_resources_present"
+
+    return "dll_system_warning"
 
 def run_full_calculate_via_dll(model: Dict[str, Any], scenario: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not model:
@@ -1244,12 +1629,7 @@ def run_full_calculate_via_dll(model: Dict[str, Any], scenario: Optional[Dict[st
     _validate_model(model_with_scenario)
     model_for_dll_contract = _convert_model_to_mpx_contract(model_with_scenario)
     payload = _build_dll_model_payload(model_for_dll_contract)
-    persisted_input_dir = _persist_input_debug_artifacts(
-        model,
-        model_with_scenario,
-        model_for_dll_contract,
-        payload,
-    )
+    persisted_input_dir = _persist_input_debug_artifacts()
 
     tmp = tempfile.mkdtemp(prefix="rmct_dll_")
     output_root = Path(tmp)
@@ -1270,7 +1650,7 @@ def run_full_calculate_via_dll(model: Dict[str, Any], scenario: Optional[Dict[st
             try:
                 rc, used_mode = run_model_from_json(str(input_json_path), output_dir=str(output_dir), routing_mode="auto")
             except Exception as exc:
-                persisted_dir = _persist_failure_artifacts(output_dir)
+                persisted_dir = _persist_failure_artifacts()
                 attempt_diagnostics.append(
                     {
                         "attempt": attempt,
@@ -1302,7 +1682,7 @@ def run_full_calculate_via_dll(model: Dict[str, Any], scenario: Optional[Dict[st
             )
 
             if has_retryable_dll_signal:
-                persisted_dir = _persist_failure_artifacts(output_dir)
+                persisted_dir = _persist_failure_artifacts()
                 fatal_text = _first_fatal_error_text(err_raw_rows) or (
                     parsed_errors[0] if parsed_errors else None
                 )
@@ -1323,16 +1703,12 @@ def run_full_calculate_via_dll(model: Dict[str, Any], scenario: Optional[Dict[st
                         "resultErrors": parsed_errors,
                         "resultWarnings": parsed_warnings,
                         "overLimitResources": over_limit_resources,
-                        "resultsErrPreview": _safe_preview(output_dir / "results.err"),
+                        "resultsErrPreview": _safe_preview(output_dir / results_err),
                         "persistedOutputDir": persisted_dir,
-                        "retryReason": (
-                            "fatal_results_err_row"
-                            if fatal_error_rows
-                            else "results_err_rows_present"
-                            if parsed_errors
-                            else "over_limit_resources_present"
-                            if over_limit_resources
-                            else "dll_system_warning"
+                        "retryReason": _retry_reason(
+                            fatal_error_rows,
+                            parsed_errors,
+                            over_limit_resources,
                         ),
                     }
                 )

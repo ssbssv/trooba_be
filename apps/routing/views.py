@@ -14,6 +14,7 @@ from .models import Routing
 from .routing_path import apply_routing_cell_update
 from apps.organizations.scoping import get_org_context
 from apps.organizations.nested_rows import revive_soft_deleted, sync_row_organization
+from apps.organizations.provisioning import user_display_name
 
 
 def _parse_json(request):
@@ -118,7 +119,7 @@ def model_routing_create(request, model_id):
 
     data = _parse_json(request)
     if data is None:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+        return JsonResponse({"error": "Invalid data"}, status=400)
 
     org = _get_org_from_model(m)
     if not org:
@@ -132,7 +133,7 @@ def model_routing_create(request, model_id):
     pct_routed = data.get("pct_routed", 100)
 
     if pct_routed < 0 or pct_routed > 100:
-        return JsonResponse({"error": "pct_routed must be 0-100"}, status=400)
+        return JsonResponse({"error": "product_routed must be 0-100"}, status=400)
 
     if not product_id or not from_op_name or not to_op_name:
         return JsonResponse(
@@ -264,7 +265,8 @@ def model_routing_set(request, model_id):
     dedupe_routing_meta_operations_for_product(product)
 
     m.updated_at = timezone.now()
-    m.save(update_fields=["updated_at"])
+    m.last_updated_by_name = user_display_name(request.user)
+    m.save(update_fields=["updated_at", "last_updated_by_name"])
 
     return JsonResponse({})
 

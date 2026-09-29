@@ -33,7 +33,7 @@ class BOM(models.Model):
 
     position = models.IntegerField(default=1)
 
-    comments = models.TextField(null=True, blank=True)
+    comments = models.TextField(blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 

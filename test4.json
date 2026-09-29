@@ -10,7 +10,7 @@
       "conv2": 210.0,
       "util_limit": 95.0,
       "var_equip": 30.0,
-      "var_labor": 30.0,
+      "var_labor": 35.0,
       "var_prod": 30.0
     },
     "labor": [

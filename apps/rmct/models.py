@@ -27,6 +27,7 @@ class RMCMModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_run_at = models.DateTimeField(null=True, blank=True)
+    last_updated_by_name = models.CharField(max_length=255, blank=True, default='')
     run_status = models.CharField(max_length=20, default='never_run')  # never_run, current, needs_recalc
     is_archived = models.BooleanField(default=False)
     is_demo = models.BooleanField(default=False)
@@ -109,6 +110,9 @@ class ScenarioChange(models.Model):
     field_name = models.CharField(max_length=255)
     basecase_value = models.TextField(blank=True)
     whatif_value = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
+    changed_by_name = models.CharField(max_length=255, blank=True, default='')
 
 
 class ScenarioResult(models.Model):

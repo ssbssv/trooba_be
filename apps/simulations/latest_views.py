@@ -1090,6 +1090,7 @@ def apply_scenario(model, scenario):
         tl  = {"Labor": "labor", "Equipment": "equipment",
                 "Product": "products", "Routing": "routing"}.get(dt)
         if tl:
+            matched = False
             for item in m.get(tl, []):
                 if item.get("id") == eid:
                     if dt == "Product" and fld == "included" and str(val) == "false":
@@ -1098,7 +1099,13 @@ def apply_scenario(model, scenario):
                         item[fld] = float(val) if val is not None else 0
                     else:
                         item[fld] = val
+                    matched = True
                     break
+            if not matched and dt == "Routing":
+                for op in m.get("operations", []):
+                    if op.get("id") == eid and fld:
+                        op[fld] = float(val) if val is not None else 0
+                        break
         elif dt == "Product Inclusion" and val == "No":
             for p in m.get("products", []):
                 if p.get("id") == eid:

@@ -5,60 +5,79 @@ class ApiAuthMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
 
-    def __call__(self, request):
 
-        if request.path.startswith("/api/"):
-            # Browser session bootstrap (same-origin /api proxy); not for JWT.
-            if request.path.startswith("/api/auth/"):
-                return self.get_response(request)
+    def _handle_admin_request(self, request):
+        from apps.admin.auth import is_admin_session
 
-            # TF Admin portal uses its own session flag (tf_admin), not Django user auth.
-            if request.path.startswith("/api/admin/"):
-                from apps.admin.auth import is_admin_session
-                admin_public = (
-                    "/api/admin/login/",
-                    "/api/admin/login",
-                )
-                if request.path in admin_public:
-                    return self.get_response(request)
-                if not is_admin_session(request):
-                    return JsonResponse({"error": "Unauthorized"}, status=401)
-                return self.get_response(request)
+        admin_public = {
+            "/api/admin/login/",
+            "/api/admin/login",
+        }
 
-            public_paths = [
-                "/api/login/",
-                "/api/signup/",
-                "/api/csrf/",
-                # Public org invitation acceptance (new user may not be logged in yet)
-                "/api/organizations/invites/accept/",
-                "/api/organizations/invites/accept",
-                "/api/organizations/invites/preview/",
-                "/api/organizations/invites/preview",
-            ]
+        if request.path in admin_public:
+            return None
 
-            if request.path not in public_paths:
-                if not request.user.is_authenticated:
+        if not is_admin_session(request):
+            return JsonResponse({"error": "Unauthorized"}, status=401)
+
+        return None
+
+    def _handle_portal_request(self, request):
+        public_paths = {
+            "/api/login/",
+            "/api/signup/",
+            "/api/csrf/",
+            "/api/organizations/invites/accept/",
+            "/api/organizations/invites/accept",
+            "/api/organizations/invites/preview/",
+            "/api/organizations/invites/preview",
+        }
+
+        if request.path in public_paths:
+            return None
+
+        if not request.user.is_authenticated:
+            return JsonResponse({"error": "Unauthorized"}, status=401)
+
+        from apps.users.access import portal_access_block_reason
+
+        block = portal_access_block_reason(request.user)
+        if block:
+            return JsonResponse(
+                {"error": block, "code": "account_frozen"},
+                status=403,
+            )
+
+        if request.path != "/api/profile/password/":
+            try:
+                if getattr(request.user.profile, "must_change_password", False):
                     return JsonResponse(
-                        {"error": "Unauthorized"},
-                        status=401
-                    )
-                from apps.users.access import portal_access_block_reason
-                block = portal_access_block_reason(request.user)
-                if block:
-                    return JsonResponse(
-                        {"error": block, "code": "account_frozen"},
+                        {
+                            "error": "Password change required",
+                            "code": "must_change_password",
+                        },
                         status=403,
                     )
-                # Force password change on first login (org owners/admin-created users).
-                if request.path != "/api/profile/password/":
-                    try:
-                        profile = request.user.profile
-                        if getattr(profile, "must_change_password", False):
-                            return JsonResponse(
-                                {"error": "Password change required", "code": "must_change_password"},
-                                status=403
-                            )
-                    except Exception:
-                        pass
+            except Exception:
+                pass
+
+        return None
+    def __call__(self, request):
+
+        if not request.path.startswith("/api/"):
+            return self.get_response(request)
+
+        if request.path.startswith("/api/auth/"):
+            return self.get_response(request)
+
+        if request.path.startswith("/api/admin/"):
+            response = self._handle_admin_request(request)
+            if response:
+                return response
+            return self.get_response(request)
+
+        response = self._handle_portal_request(request)
+        if response:
+            return response
 
         return self.get_response(request)

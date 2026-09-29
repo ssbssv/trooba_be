@@ -51,19 +51,17 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         dry_run = options["dry_run"]
-        repair_links = options["repair_model_links"] or options["all_users"]
+        repair_links = (
+            options["repair_model_links"]
+            or options["all_users"]
+        )
         batch_size = max(1, options["batch_size"])
 
-        orphan_ids = set()
-        for user in users_needing_organization():
-            orphan_ids.add(user.id)
+        orphan_ids, repair_ids, target_ids = self._collect_target_user_ids(
+            repair_links,
+            batch_size,
+        )
 
-        repair_ids = set()
-        if repair_links:
-            for user in user_ids_with_mislinked_models().iterator(chunk_size=batch_size):
-                repair_ids.add(user.id)
-
-        target_ids = sorted(orphan_ids | repair_ids)
         self.stdout.write(
             f"Targets: {len(orphan_ids)} without membership, "
             f"{len(repair_ids)} with model-link repair, "
@@ -71,10 +69,7 @@ class Command(BaseCommand):
         )
 
         if dry_run:
-            for uid in target_ids:
-                u = User.objects.filter(id=uid).only("id", "email").first()
-                if u:
-                    self.stdout.write(f"  would provision: {u.id} {u.email}")
+            self._handle_dry_run(target_ids)
             return
 
         created = 0
@@ -84,40 +79,91 @@ class Command(BaseCommand):
 
         for uid in target_ids:
             user = User.objects.filter(id=uid).first()
-            if not user:
+
+            if user is None:
                 continue
+
             try:
-                org, was_created, models_linked = ensure_user_organization(
+                was_created, linked = self._process_user(
                     user,
-                    force_model_relink=uid in repair_ids,
+                    repair_ids,
                 )
             except Exception as exc:
                 errors += 1
-                self.stderr.write(f"ERROR {user.email}: {exc}")
+                self.stderr.write(
+                    f"ERROR {user.email}: {exc}"
+                )
                 continue
 
-            models_total += models_linked
+            models_total += linked
+
             if was_created:
                 created += 1
-                self.stdout.write(
-                    self.style.SUCCESS(
-                        f"Created org '{org.name}' for {user.email} "
-                        f"(linked {models_linked} model(s))"
-                    )
-                )
             else:
                 repaired += 1
-                if models_linked:
-                    self.stdout.write(
-                        f"Repaired {user.email} -> {org.name} "
-                        f"(linked {models_linked} model(s))"
-                    )
 
         summary = (
-            f"Done. created={created} repaired={repaired} "
-            f"models_linked={models_total} errors={errors}"
+            f"Done. created={created} "
+            f"repaired={repaired} "
+            f"models_linked={models_total} "
+            f"errors={errors}"
         )
+
         if errors:
             self.stderr.write(self.style.ERROR(summary))
         else:
             self.stdout.write(self.style.SUCCESS(summary))
+
+    def _collect_target_user_ids(
+            self,
+            repair_links: bool,
+            batch_size: int,
+        ):
+        orphan_ids = {user.id for user in users_needing_organization()}
+
+        repair_ids = set()
+        if repair_links:
+            repair_ids = {
+                user.id
+                for user in user_ids_with_mislinked_models().iterator(
+                    chunk_size=batch_size
+                )
+            }
+
+        target_ids = sorted(orphan_ids | repair_ids)
+
+        return orphan_ids, repair_ids, target_ids
+
+    def _handle_dry_run(self, target_ids):
+        for uid in target_ids:
+            user = User.objects.filter(id=uid).only("id", "email").first()
+            if user:
+                self.stdout.write(
+                    f"  would provision: {user.id} {user.email}"
+                )
+    def _process_user(
+            self,
+            user,
+            repair_ids,
+        ):
+        org, created, linked = ensure_user_organization(
+            user,
+            force_model_relink=user.id in repair_ids,
+        )
+
+        if created:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Created org '{org.name}' for {user.email} "
+                    f"(linked {linked} model(s))"
+                )
+            )
+
+        elif linked:
+            self.stdout.write(
+                f"Repaired {user.email} -> {org.name} "
+                f"(linked {linked} model(s))"
+            )
+
+        return created, linked
+    

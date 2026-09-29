@@ -40,6 +40,20 @@ def _require_authenticated(request):
     return None
 
 
+def _user_display_name(user):
+    if not user or not user.is_authenticated:
+        return ''
+    full = (user.get_full_name() or '').strip()
+    return full or getattr(user, 'email', '') or ''
+
+
+def _touch_model_metadata(model, user):
+    from django.utils import timezone
+    model.updated_at = timezone.now()
+    model.last_updated_by_name = _user_display_name(user)
+    model.save(update_fields=['updated_at', 'last_updated_by_name'])
+
+
 def _owned_models_qs(request):
     ctx, err = get_org_context(request)
     if err:
@@ -363,6 +377,7 @@ def _model_to_payload(m: RMCMModel) -> dict:
         'tags': m.tags or [],
         'created_at': m.created_at.isoformat() if m.created_at else '',
         'updated_at': m.updated_at.isoformat() if m.updated_at else '',
+        'last_updated_by_name': getattr(m, 'last_updated_by_name', '') or '',
         'last_run_at': last_run_serialized,
         'run_status': m.run_status or 'never_run',
         'is_archived': bool(m.is_archived),
@@ -466,10 +481,15 @@ def model_save(request, model_id=None):
     if existing:
         for key, value in defaults.items():
             setattr(existing, key, value)
+        existing.last_updated_by_name = _user_display_name(request.user)
         existing.save()
         obj, created = existing, False
     else:
-        obj = RMCMModel.objects.create(id=uid, **defaults)
+        obj = RMCMModel.objects.create(
+            id=uid,
+            last_updated_by_name=_user_display_name(request.user),
+            **defaults,
+        )
         created = True
     return JsonResponse(_model_to_payload(obj), status=201 if created else 200)
 
@@ -493,6 +513,7 @@ def model_patch(request, model_id):
         m.param_names = data['param_names']
     if isinstance(data.get('dept_codes'), dict):
         m.dept_codes = data['dept_codes']
+    m.last_updated_by_name = _user_display_name(request.user)
     m.save()
     return JsonResponse(_model_to_payload(m))
 
@@ -611,7 +632,7 @@ def model_labor_create(request, model_id):
         'count': data.get('count', 1),
         'overtime_percent': data.get('overtime_pct', 0),
         'unavailability_percent': data.get('unavail_pct', 0),
-        'department': data.get('dept_code') or None,
+        'department': data.get('dept_code') or '',
         'setup_factor': data.get('setup_factor', 1),
         'run_factor': data.get('run_factor', 1),
         'variable_factor': data.get('var_factor', 1),
@@ -659,7 +680,7 @@ def model_labor_update(request, model_id, labor_id):
     if 'unavail_pct' in data:
         labor.unavailability_percent = data['unavail_pct']
     if 'dept_code' in data:
-        labor.department = data['dept_code'] or None
+        labor.department = data['dept_code'] or ''
     if 'setup_factor' in data:
         labor.setup_factor = data['setup_factor']
     if 'run_factor' in data:
@@ -875,6 +896,7 @@ def _scenario_to_payload(s: Scenario, changes_list: list) -> dict:
     }
 
 
+@csrf_exempt
 def scenario_list_or_create(request, model_id):
     """GET /api/models/:modelId/scenarios — list. POST — create (body: name, description)."""
     if request.method == 'POST':
@@ -906,6 +928,9 @@ def scenario_list(request, model_id):
             'fieldLabel': c.field_name,
             'basecaseValue': c.basecase_value,
             'whatIfValue': c.whatif_value,
+            'createdAt': c.created_at.isoformat() if c.created_at else None,
+            'updatedAt': c.updated_at.isoformat() if c.updated_at else None,
+            'changedByName': c.changed_by_name or None,
         })
     results_map = {}
     for s in scenarios_qs:
@@ -941,6 +966,7 @@ def scenario_basecase_results(request, model_id):
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
 
+@csrf_exempt
 @require_http_methods(['POST'])
 def scenario_ensure_basecase(request, model_id):
     """POST /api/models/:modelId/scenarios/basecase — idempotent, return { id }."""
@@ -973,6 +999,7 @@ def scenario_create(request, model_id):
     return JsonResponse({'id': str(sid)}, status=201)
 
 
+@csrf_exempt
 @require_http_methods(['PATCH'])
 def scenario_patch(request, scenario_id):
     """PATCH /api/scenarios/:id — name, description, status."""
@@ -990,6 +1017,7 @@ def scenario_patch(request, scenario_id):
     return JsonResponse({})
 
 
+@csrf_exempt
 @require_http_methods(['DELETE'])
 def scenario_delete(request, scenario_id):
     auth_err = _require_authenticated(request)
@@ -1004,6 +1032,7 @@ def scenario_delete(request, scenario_id):
     return JsonResponse({}, status=204)
 
 
+@csrf_exempt
 @require_http_methods(['PUT'])
 def scenario_upsert_change(request, scenario_id):
     """PUT /api/scenarios/:id/changes — body: ScenarioChange."""
@@ -1028,6 +1057,7 @@ def scenario_upsert_change(request, scenario_id):
     basecase_value = str(data.get('basecaseValue', data.get('basecase_value', '')))
     whatif_value = str(data.get('whatIfValue', data.get('whatif_value', '')))
     data_type = data.get('dataType') or data.get('data_type', '')
+    changed_by_name = data.get('changedByName') or data.get('changed_by_name', '')
     defaults = {
         'scenario': s,
         'data_type': data_type,
@@ -1036,11 +1066,13 @@ def scenario_upsert_change(request, scenario_id):
         'field_name': field,
         'basecase_value': basecase_value,
         'whatif_value': whatif_value,
+        'changed_by_name': str(changed_by_name or ''),
     }
     ScenarioChange.objects.update_or_create(id=change_id, defaults=defaults)
     return JsonResponse({})
 
 
+@csrf_exempt
 @require_http_methods(['DELETE'])
 def scenario_remove_change(request, scenario_id, change_id):
     auth_err = _require_authenticated(request)

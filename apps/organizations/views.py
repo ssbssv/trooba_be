@@ -330,62 +330,29 @@ def invite_preview(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def accept_invite(request):
-    """
-    Accept invite using token + password.
-    Creates user if missing, adds OrganizationMember, marks invite accepted,
-    assigns member role, and sets active org if not already set.
-    """
     data = _parse_json(request)
-    token = (data.get("token") or "").strip()
-    password = (data.get("password") or "").strip()
-    full_name = (data.get("name") or data.get("full_name") or "").strip()
 
-    if not token:
-        return JsonResponse({"error": "token is required"}, status=400)
-    if not password or len(password) < 8:
-        return JsonResponse({"error": "password must be at least 8 characters"}, status=400)
-
-    invite = OrganizationInvite.objects.filter(token=token).select_related("organization").first()
-    if invite is None:
-        return JsonResponse({"error": "Invalid invite token"}, status=400)
-    if invite.accepted:
-        return JsonResponse({"error": "Invite already accepted"}, status=400)
-    if invite.is_expired():
-        return JsonResponse({"error": "Invite expired"}, status=400)
-
-    email = (invite.email or "").strip().lower()
-    user = User.objects.filter(email__iexact=email).first()
-    if user is None:
-        user = User.objects.create_user(
-            username=email,
-            email=email,
-            password=password,
-            first_name=full_name or email.split("@")[0],
+    try:
+        token, password, full_name = _validate_accept_invite_request(data)
+        invite = _get_valid_invite(token)
+        user, email = _get_or_create_invited_user(
+            invite,
+            password,
+            full_name,
         )
-    else:
-        # Existing user: require authentication by setting their password is dangerous;
-        # just set the password provided during accept (invite link possession assumed).
-        user.set_password(password)
-        user.save()
 
-    OrganizationMember.objects.get_or_create(organization=invite.organization, user=user)
+    except ValueError as exc:
+        return JsonResponse(
+            {"error": str(exc)},
+            status=400,
+        )
 
-    profile, _ = UserProfile.objects.get_or_create(
-        user=user,
-        defaults={
-            "full_name": full_name or (user.get_full_name() or email),
-            "organization": invite.organization,
-            "role": "member",
-        }
+    _configure_invited_member(
+        user,
+        invite,
+        full_name,
+        email,
     )
-    if not profile.organization_id:
-        profile.organization = invite.organization
-    if not profile.full_name and full_name:
-        profile.full_name = full_name
-    if not profile.role or profile.role == "user":
-        profile.role = "member"
-    profile.must_change_password = False
-    profile.save()
 
     invite.accepted = True
     invite.save(update_fields=["accepted"])
@@ -395,14 +362,97 @@ def accept_invite(request):
         user.save(update_fields=["is_active"])
 
     login(request, user)
+
     profile_payload = get_profile_payload(user)
     profile_payload["authenticated"] = True
 
-    return JsonResponse({
-        "message": "Invite accepted",
-        "organization_id": str(invite.organization_id),
-        "organization_name": invite.organization.name,
-        "user_id": user.id,
-        "email": email,
-        "profile": profile_payload,
-    })
+    return JsonResponse(
+        {
+            "message": "Invite accepted",
+            "organization_id": str(invite.organization_id),
+            "organization_name": invite.organization.name,
+            "user_id": user.id,
+            "email": email,
+            "profile": profile_payload,
+        }
+    )
+
+def _validate_accept_invite_request(data):
+    token = (data.get("token") or "").strip()
+    password = (data.get("password") or "").strip()
+    full_name = (data.get("name") or data.get("full_name") or "").strip()
+
+    if not token:
+        raise ValueError("token is required")
+
+    if len(password) < 8:
+        raise ValueError("password must be at least 8 characters")
+
+    return token, password, full_name
+
+def _get_valid_invite(token):
+    invite = (
+        OrganizationInvite.objects
+        .filter(token=token)
+        .select_related("organization")
+        .first()
+    )
+
+    if invite is None:
+        raise ValueError("Invalid invite token")
+
+    if invite.accepted:
+        raise ValueError("Invite already accepted")
+
+    if invite.is_expired():
+        raise ValueError("Invite expired")
+
+    return invite
+
+def _get_or_create_invited_user(invite, password, full_name):
+    email = (invite.email or "").strip().lower()
+
+    user = User.objects.filter(email__iexact=email).first()
+
+    if user is None:
+        user = User.objects.create_user(
+            username=email,
+            email=email,
+            password=password,
+            first_name=full_name or email.split("@")[0],
+        )
+    else:
+        user.set_password(password)
+        user.save(update_fields=["password"])
+
+    return user, email
+
+def _configure_invited_member(user, invite, full_name, email):
+    OrganizationMember.objects.get_or_create(
+        organization=invite.organization,
+        user=user,
+    )
+
+    profile, _ = UserProfile.objects.get_or_create(
+        user=user,
+        defaults={
+            "full_name": full_name or (user.get_full_name() or email),
+            "organization": invite.organization,
+            "role": "member",
+        },
+    )
+
+    if not profile.organization_id:
+        profile.organization = invite.organization
+
+    if full_name and not profile.full_name:
+        profile.full_name = full_name
+
+    if not profile.role or profile.role == "user":
+        profile.role = "member"
+
+    profile.must_change_password = False
+    profile.save()
+
+    return profile
+

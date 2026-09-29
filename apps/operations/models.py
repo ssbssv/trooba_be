@@ -81,11 +81,10 @@ class Operation(models.Model):
     formula_override = models.CharField(
         max_length=20,
         choices=FORMULA_CHOICES,
-        null=True,
         blank=True
     )
 
-    comments = models.TextField(null=True, blank=True)
+    comments = models.TextField( blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 

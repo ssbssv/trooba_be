@@ -26,15 +26,15 @@ class Organization(models.Model):
     )
 
     # TF Admin is session-based (not a Django User). We persist who created the org for audit.
-    created_by_admin_email = models.EmailField(null=True, blank=True, db_index=True)
+    created_by_admin_email = models.EmailField( blank=True, db_index=True)
 
-    plan_type = models.CharField(max_length=50, null=True, blank=True)
+    plan_type = models.CharField(max_length=50,  blank=True)
 
     contact_email = models.EmailField(null=True, blank=True)
-    contact_phone = models.CharField(max_length=20, null=True, blank=True)
+    contact_phone = models.CharField(max_length=20,  blank=True)
 
-    country = models.CharField(max_length=100, null=True, blank=True)
-    timezone = models.CharField(max_length=100, null=True, blank=True)
+    country = models.CharField(max_length=100,  blank=True)
+    timezone = models.CharField(max_length=100, blank=True)
 
     status = models.SmallIntegerField(default=1, db_index=True)
 

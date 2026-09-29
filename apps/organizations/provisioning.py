@@ -143,100 +143,152 @@ def ensure_user_organization(
     *,
     org_name: str | None = None,
     force_model_relink: bool = False,
-) -> tuple[Organization, bool, int]:
-    """
-    Guarantee org membership and active profile.organization.
-
-    Returns (organization, created_new_org, models_linked_count).
-    Idempotent: safe to run multiple times (management command / repair jobs).
-    """
+ ) -> tuple[Organization, bool, int]:
     with transaction.atomic():
         profile, _ = UserProfile.objects.select_for_update().get_or_create(
             user=user,
-            defaults={"full_name": user_display_name(user)},
+            defaults={
+                "full_name": user_display_name(user),
+            },
         )
+
         previous_org_id = profile.organization_id
 
         owned_org = (
-            Organization.objects.filter(owner=user, deleted_at__isnull=True)
+            Organization.objects.filter(
+                owner=user,
+                deleted_at__isnull=True,
+            )
             .order_by("created_at")
             .only("id", "name", "owner_id")
             .first()
         )
+
         member_org_ids = list(
             OrganizationMember.objects.filter(user=user)
             .order_by("joined_at")
             .values_list("organization_id", flat=True)
         )
 
-        created = False
-        profile_dirty: list[str] = []
-
         if owned_org is None and not member_org_ids:
-            display = (org_name or user_display_name(user, profile)).strip()
-            owned_org = Organization.objects.create(
-                name=display,
-                organization_code=_unique_organization_code(display),
-                slug=_unique_organization_slug(display),
-                owner=user,
-                contact_email=(user.email or "").strip() or None,
-                status=1,
+            organization, created = _create_user_organization(
+                user,
+                profile,
+                org_name,
             )
-            OrganizationMember.objects.create(organization=owned_org, user=user)
-            profile.organization = owned_org
-            profile.role = "org_owner"
-            profile_dirty = ["organization", "role", "full_name", "updated_at"]
-            if not (profile.full_name or "").strip():
-                profile.full_name = display
-            created = True
         else:
-            org = owned_org
-            if org is None:
-                org = (
-                    Organization.objects.filter(
-                        id__in=member_org_ids, deleted_at__isnull=True
-                    )
-                    .order_by("created_at")
-                    .only("id", "owner_id")
-                    .first()
-                )
-            if org is None:
-                raise ValueError(
-                    f"User {user.id} has memberships but no valid organization"
-                )
-
-            OrganizationMember.objects.get_or_create(organization=org, user=user)
-
-            if org.owner_id == user.id and profile.role != "org_owner":
-                profile.role = "org_owner"
-                profile_dirty.append("role")
-            if (
-                not profile.organization_id
-                or profile.organization_id not in member_org_ids
-            ):
-                profile.organization = org
-                profile_dirty.append("organization")
-            owned_org = org
-
-        if profile_dirty:
-            profile_dirty.append("updated_at")
-            profile.save(update_fields=list(dict.fromkeys(profile_dirty)))
+            organization = _resolve_existing_organization(
+                user,
+                profile,
+                owned_org,
+                member_org_ids,
+            )
+            created = False
 
         models_linked = 0
-        need_relink = (
+
+        if (
             force_model_relink
             or created
-            or previous_org_id != owned_org.id
-            or user_has_mislinked_models(user.id, owned_org.id)
-        )
-        if need_relink:
+            or previous_org_id != organization.id
+            or user_has_mislinked_models(user.id, organization.id)
+        ):
             models_linked = attach_user_models_to_organization(
                 user,
-                owned_org,
+                organization,
                 previous_org_id=previous_org_id,
             )
 
-        return owned_org, created, models_linked
+        return (
+            organization,
+            created,
+            models_linked,
+        )
+
+def _create_user_organization(
+    user: User,
+    profile: UserProfile,
+    org_name: str | None,
+) -> tuple[Organization, bool]:
+    display = (org_name or user_display_name(user, profile)).strip()
+
+    organization = Organization.objects.create(
+        name=display,
+        organization_code=_unique_organization_code(display),
+        slug=_unique_organization_slug(display),
+        owner=user,
+        contact_email=(user.email or "").strip() or None,
+        status=1,
+    )
+
+    OrganizationMember.objects.create(
+        organization=organization,
+        user=user,
+    )
+
+    if not (profile.full_name or "").strip():
+        profile.full_name = display
+
+    profile.organization = organization
+    profile.role = "org_owner"
+    profile.save(
+        update_fields=[
+            "organization",
+            "role",
+            "full_name",
+            "updated_at",
+        ]
+    )
+
+    return organization, True
+
+def _resolve_existing_organization(
+    user: User,
+    profile: UserProfile,
+    owned_org: Organization | None,
+    member_org_ids: list[uuid.UUID],
+) -> Organization:
+    organization = owned_org
+
+    if organization is None:
+        organization = (
+            Organization.objects.filter(
+                id__in=member_org_ids,
+                deleted_at__isnull=True,
+            )
+            .order_by("created_at")
+            .only("id", "owner_id")
+            .first()
+        )
+
+    if organization is None:
+        raise ValueError(
+            f"User {user.id} has memberships but no valid organization"
+        )
+
+    OrganizationMember.objects.get_or_create(
+        organization=organization,
+        user=user,
+    )
+
+    dirty_fields = []
+
+    if organization.owner_id == user.id and profile.role != "org_owner":
+        profile.role = "org_owner"
+        dirty_fields.append("role")
+
+    if (
+        not profile.organization_id
+        or profile.organization_id not in member_org_ids
+    ):
+        profile.organization = organization
+        dirty_fields.append("organization")
+
+    if dirty_fields:
+        dirty_fields.append("updated_at")
+        profile.save(update_fields=dirty_fields)
+
+    return organization
 
 
 def ensure_user_organization_if_needed(user: User) -> bool:

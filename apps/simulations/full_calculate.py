@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 
 def _sanitize(v: float) -> float:
-    return v if (v == v and abs(v) != float("inf")) else 0.0
+    return v if (abs(v) != float("inf")) else 0.0
 
 
 def _round1(x: float) -> float:
@@ -21,62 +21,135 @@ def _round4(x: float) -> float:
     return round(x * 10000) / 10000
 
 
-def apply_scenario(model: Dict[str, Any], scenario: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def apply_scenario(
+    model: Dict[str, Any],
+    scenario: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
     """Apply what-if scenario changes to a copy of the model."""
+
     if not scenario or not scenario.get("changes"):
         return copy.deepcopy(model)
 
-    m = copy.deepcopy(model)
-    # Ensure mutable lists for in-place updates
-    m["labor"] = [dict(x) for x in m.get("labor", [])]
-    m["equipment"] = [dict(x) for x in m.get("equipment", [])]
-    m["products"] = [dict(x) for x in m.get("products", [])]
-    m["operations"] = [dict(x) for x in m.get("operations", [])]
-    m["routing"] = [dict(x) for x in m.get("routing", [])]
+    updated_model = copy.deepcopy(model)
 
-    for c in scenario["changes"]:
-        data_type = c.get("dataType")
-        entity_id = c.get("entityId")
-        field = c.get("field")
-        what_if = c.get("whatIfValue")
+    for key in (
+        "labor",
+        "equipment",
+        "products",
+        "operations",
+        "routing",
+    ):
+        updated_model[key] = [
+            dict(item)
+            for item in updated_model.get(key, [])
+        ]
 
-        if data_type == "Labor":
-            for item in m["labor"]:
-                if item.get("id") == entity_id:
-                    item[field] = what_if
-                    break
-        elif data_type == "Equipment":
-            for item in m["equipment"]:
-                if item.get("id") == entity_id:
-                    item[field] = what_if
-                    break
-        elif data_type == "Product":
-            if field == "included" and str(what_if) == "false":
-                for p in m["products"]:
-                    if p.get("id") == entity_id:
-                        p["demand"] = 0
-                        break
-            else:
-                for item in m["products"]:
-                    if item.get("id") == entity_id:
-                        item[field] = what_if
-                        break
-        elif data_type == "Routing":
-            for item in m["routing"]:
-                if item.get("id") == entity_id:
-                    item[field] = float(what_if) if what_if is not None else 0
-                    break
-        elif data_type == "Product Inclusion" and what_if == "No":
-            for p in m["products"]:
-                if p.get("id") == entity_id:
-                    p["demand"] = 0
-                    break
+    for change in scenario["changes"]:
+        _apply_change(
+            updated_model,
+            change,
+        )
 
-    return m
+    return updated_model
+
+def _find_entity(items: list[dict], entity_id: str):
+    for item in items:
+        if item.get("id") == entity_id:
+            return item
+    return None
+
+def _apply_product_change(
+    products: list[dict],
+    entity_id: str,
+    field: str,
+    what_if: Any,
+) -> None:
+    product = _find_entity(products, entity_id)
+
+    if product is None:
+        return
+
+    if field == "included" and str(what_if).lower() == "false":
+        product["demand"] = 0
+        return
+
+    product[field] = what_if
+
+def _apply_routing_change(
+    routing: list[dict],
+    entity_id: str,
+    field: str,
+    what_if: Any,
+) -> None:
+    route = _find_entity(routing, entity_id)
+
+    if route is None:
+        return
+
+    route[field] = float(what_if) if what_if is not None else 0
+
+def _apply_change(model: dict, change: dict) -> None:
+    data_type = change.get("dataType")
+    entity_id = change.get("entityId")
+    field = change.get("field")
+    what_if = change.get("whatIfValue")
+
+    if data_type == "General":
+        general = model.get("general")
+        if isinstance(general, dict) and field:
+            general[field] = what_if
+        return
+
+    if data_type == "Labor":
+        labor = _find_entity(model["labor"], entity_id)
+        if labor:
+            labor[field] = what_if
+
+    elif data_type == "Equipment":
+        equipment = _find_entity(model["equipment"], entity_id)
+        if equipment:
+            equipment[field] = what_if
+
+    elif data_type == "Product":
+        _apply_product_change(
+            model["products"],
+            entity_id,
+            field,
+            what_if,
+        )
+
+    elif data_type == "Routing":
+        route = _find_entity(model.get("routing", []), entity_id)
+        if route is not None:
+            _apply_routing_change(
+                model["routing"],
+                entity_id,
+                field,
+                what_if,
+            )
+            return
+        operation = _find_entity(model.get("operations", []), entity_id)
+        if operation is not None and field:
+            operation[field] = (
+                float(what_if) if what_if is not None else 0
+            )
+
+    elif (
+        data_type == "Product Inclusion"
+        and what_if == "No"
+    ):
+        product = _find_entity(
+            model["products"],
+            entity_id,
+        )
+
+        if product:
+            product["demand"] = 0
+
 
 
 def compute_effective_demand(
-    products: List[Dict], ibom: List[Dict], conv2: float
+    products: List[Dict], ibom: List[Dict]
 ) -> Dict[str, float]:
     """IBOM-driven demand: total demand per product including component demand from parents."""
     children: Dict[str, List[Dict[str, Any]]] = {}
@@ -136,12 +209,11 @@ def full_calculate(model: Dict[str, Any], scenario: Optional[Dict[str, Any]] = N
     ops_per_period = conv1 * conv2
 
     effective_demand = compute_effective_demand(
-        m.get("products", []), m.get("ibom", []), conv2
+        m.get("products", []), m.get("ibom", [])
     )
 
     util_limit = float(g.get("util_limit", 85))
     var_equip = float(g.get("var_equip", 0)) / 100
-    var_labor = float(g.get("var_labor", 0)) / 100
     var_prod = float(g.get("var_prod", 0)) / 100
 
     # —— Equipment utilization ——
@@ -458,5 +530,5 @@ def full_calculate(model: Dict[str, Any], scenario: Optional[Dict[str, Any]] = N
         "warnings": warnings,
         "errors": errors,
         "overLimitResources": over_limit,
-        "calculatedAt": datetime.utcnow().isoformat() + "Z",
+        "calculatedAt": datetime.now(UTC).isoformat(),
     }

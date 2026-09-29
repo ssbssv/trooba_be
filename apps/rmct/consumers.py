@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 from typing import Any
 
 from asgiref.sync import sync_to_async
@@ -15,12 +17,45 @@ from apps.rmct.page_edit_locks import (
     mem_try_page_edit,
     page_edit_lock_key,
 )
+from apps.rmct.whatif_edit_locks import (
+    WHATIF_EDIT_TTL_SECONDS,
+    mem_get_whatif_edit,
+    mem_release_user_whatif_edits,
+    mem_release_whatif_edit,
+    mem_try_whatif_edit,
+    whatif_edit_lock_key,
+    whatif_edit_payload_from_key,
+)
 from apps.rmct.collab_service import apply_collab_cell, apply_operation_cell
 from apps.rmct.models import RMCMModel
 from redis.asyncio import Redis
 
 
 _redis: Redis | None = None
+
+DISCONNECT_OP_TIMEOUT = float(os.getenv("WS_DISCONNECT_OP_TIMEOUT", "2.0"))
+DISCONNECT_TOTAL_TIMEOUT = float(os.getenv("WS_DISCONNECT_TOTAL_TIMEOUT", "5.0"))
+
+
+async def _await_with_timeout(awaitable, timeout: float | None = None):
+    """Run an awaitable with a short timeout; never raise during disconnect cleanup."""
+    limit = DISCONNECT_OP_TIMEOUT if timeout is None else timeout
+    try:
+        return await asyncio.wait_for(awaitable, timeout=limit)
+    except (asyncio.TimeoutError, Exception):
+        return None
+
+
+async def _safe_group_discard(channel_layer, group: str, channel_name: str) -> None:
+    if channel_layer is None:
+        return
+    await _await_with_timeout(channel_layer.group_discard(group, channel_name))
+
+
+async def _safe_group_send(channel_layer, group: str, message: dict[str, Any]) -> None:
+    if channel_layer is None:
+        return
+    await _await_with_timeout(channel_layer.group_send(group, message))
 
 
 def _redis_client() -> Redis:
@@ -118,23 +153,41 @@ class ModelCollaborationConsumer(AsyncWebsocketConsumer):
         )
 
     async def disconnect(self, close_code):
-        if hasattr(self, "group"):
-            await self.channel_layer.group_discard(self.group, self.channel_name)
-        try:
-            if _redis_enabled():
-                await self._release_all_user_locks()
-                await self._presence_remove()
-        except Exception:
-            pass
         user = self.scope.get("user")
+
+        await _await_with_timeout(
+            self._model_disconnect_cleanup(),
+            timeout=DISCONNECT_TOTAL_TIMEOUT,
+        )
+
         if user and getattr(user, "is_authenticated", False) and hasattr(self, "group"):
-            await self.channel_layer.group_send(
+            await _safe_group_send(
+                self.channel_layer,
                 self.group,
                 {
                     "type": "broadcast",
-                    "payload": {"type": "user_left", "user_id": user.id, "name": getattr(self, "profile_name", "")},
+                    "payload": {
+                        "type": "user_left",
+                        "user_id": user.id,
+                        "name": getattr(self, "profile_name", ""),
+                    },
                 },
             )
+
+        if hasattr(self, "group"):
+            await _safe_group_discard(
+                self.channel_layer,
+                self.group,
+                self.channel_name,
+            )
+
+    async def _model_disconnect_cleanup(self) -> None:
+        if not _redis_enabled():
+            return
+
+        await self._release_all_user_locks()
+        await self._presence_remove()
+
 
     async def receive(self, text_data=None, bytes_data=None):
         if not text_data:
@@ -147,7 +200,7 @@ class ModelCollaborationConsumer(AsyncWebsocketConsumer):
 
         if msg_type == "heartbeat":
             if _redis_enabled():
-                await self._presence_touch()
+                await self._presence_touch_model()
             await self.send_json({"type": "heartbeat_ack"})
             return
 
@@ -164,8 +217,13 @@ class ModelCollaborationConsumer(AsyncWebsocketConsumer):
             return
 
     async def broadcast(self, event: dict[str, Any]):
-        payload = event.get("payload") or {}
-        await self.send_json(payload)
+        try:
+            await asyncio.wait_for(
+                self.send_json(event.get("payload") or {}),
+                timeout=2,
+            )
+        except Exception:
+            return
 
     async def send_json(self, payload: dict[str, Any]):
         await self.send(text_data=json.dumps(payload))
@@ -204,10 +262,7 @@ class ModelCollaborationConsumer(AsyncWebsocketConsumer):
         r = _redis_client()
         key = _model_presence_key(model_id=self.model_id)
         user = self.scope["user"]
-        try:
-            await r.hdel(key, str(user.id))
-        except Exception:
-            return
+        await _await_with_timeout(r.hdel(key, str(user.id)))
 
     async def _release_all_user_locks(self):
         if not hasattr(self, "model_id"):
@@ -217,20 +272,25 @@ class ModelCollaborationConsumer(AsyncWebsocketConsumer):
             return
         r = _redis_client()
         ukey = _user_locks_key(org_id=self.ctx_org_id, user_id=user.id)
-        try:
-            keys = await r.smembers(ukey)
-        except Exception:
-            return
+        keys = await _await_with_timeout(r.smembers(ukey))
         if not keys:
             return
-        for k in keys:
-            try:
-                locked_by = await r.get(k)
-                if locked_by == str(user.id):
-                    await r.delete(k)
-            except Exception:
-                continue
-        await r.delete(ukey)
+        uid = str(user.id)
+        try:
+            pipe = r.pipeline()
+            for k in keys:
+                pipe.get(k)
+            values = await _await_with_timeout(pipe.execute())
+            if values is None:
+                return
+            to_delete = [k for k, v in zip(keys, values) if v == uid]
+            pipe = r.pipeline()
+            for k in to_delete:
+                pipe.delete(k)
+            pipe.delete(ukey)
+            await _await_with_timeout(pipe.execute())
+        except Exception:
+            return
 
     async def _handle_lock(self, msg: dict[str, Any]):
         row_id = str(msg.get("row_id") or "")
@@ -456,49 +516,16 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
             pass
 
     async def disconnect(self, close_code):
-        if hasattr(self, "group"):
-            try:
-                await self.channel_layer.group_discard(self.group, self.channel_name)
-            except Exception:
-                pass
         user = self.scope.get("user")
-        try:
-            if _redis_enabled():
-                await self._release_all_user_locks()
-                await self._release_all_user_page_edits()
-                await self._presence_remove()
-            elif user and getattr(user, "is_authenticated", False):
-                released = mem_release_user_keys(user_id=user.id)
-                for key in released:
-                    parts = key.split(":", 5)
-                    if len(parts) < 6:
-                        continue
-                    _, _org, model_id, entity, row_id, column = parts
-                    await self.channel_layer.group_send(
-                        self.group,
-                        {
-                            "type": "broadcast",
-                            "payload": {
-                                "type": "cell_unlocked",
-                                "entity": entity,
-                                "model_id": model_id,
-                                "row_id": row_id,
-                                "column": column,
-                            },
-                        },
-                    )
-                page_released = mem_release_user_page_edits(user_id=user.id)
-                for key in page_released:
-                    payload = _page_edit_payload_from_key(key, active=False)
-                    if payload:
-                        await self.channel_layer.group_send(
-                            self.group,
-                            {"type": "broadcast", "payload": payload},
-                        )
-        except Exception:
-            pass
+
+        await _await_with_timeout(
+            self._disconnect_cleanup(user),
+            timeout=DISCONNECT_TOTAL_TIMEOUT,
+        )
+
         if user and getattr(user, "is_authenticated", False) and hasattr(self, "group"):
-            await self.channel_layer.group_send(
+            await _safe_group_send(
+                self.channel_layer,
                 self.group,
                 {
                     "type": "broadcast",
@@ -509,6 +536,56 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
                     },
                 },
             )
+
+        if hasattr(self, "group"):
+            await _safe_group_discard(self.channel_layer, self.group, self.channel_name)
+
+    async def _disconnect_cleanup(self, user) -> None:
+        if _redis_enabled():
+            await self._release_all_user_locks()
+            await self._release_all_user_page_edits()
+            await self._presence_remove()
+            return
+        if not user or not getattr(user, "is_authenticated", False):
+            return
+        released = mem_release_user_keys(user_id=user.id)
+        for key in released:
+            parts = key.split(":", 5)
+            if len(parts) < 6:
+                continue
+            _, _org, model_id, entity, row_id, column = parts
+            await _safe_group_send(
+                self.channel_layer,
+                self.group,
+                {
+                    "type": "broadcast",
+                    "payload": {
+                        "type": "cell_unlocked",
+                        "entity": entity,
+                        "model_id": model_id,
+                        "row_id": row_id,
+                        "column": column,
+                    },
+                },
+            )
+        page_released = mem_release_user_page_edits(user_id=user.id)
+        for key in page_released:
+            payload = _page_edit_payload_from_key(key, active=False)
+            if payload:
+                await _safe_group_send(
+                    self.channel_layer,
+                    self.group,
+                    {"type": "broadcast", "payload": payload},
+                )
+        whatif_released = mem_release_user_whatif_edits(user_id=user.id)
+        for key in whatif_released:
+            payload = whatif_edit_payload_from_key(key, active=False)
+            if payload:
+                await _safe_group_send(
+                    self.channel_layer,
+                    self.group,
+                    {"type": "broadcast", "payload": payload},
+                )
 
     async def receive(self, text_data=None, bytes_data=None):
         if not text_data:
@@ -553,8 +630,22 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
             await self._handle_release_page_edit(msg)
             return
 
+        if msg_type == "acquire_whatif_edit":
+            await self._handle_acquire_whatif_edit(msg)
+            return
+
+        if msg_type == "release_whatif_edit":
+            await self._handle_release_whatif_edit(msg)
+            return
+
     async def broadcast(self, event: dict[str, Any]):
-        await self.send_json(event.get("payload") or {})
+        try:
+            await asyncio.wait_for(
+                self.send_json(event.get("payload") or {}),
+                timeout=2,
+            )
+        except Exception:
+            return
 
     async def send_json(self, payload: dict[str, Any]):
         await self.send(text_data=json.dumps(payload))
@@ -598,10 +689,7 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
         r = _redis_client()
         key = _presence_key(org_id=self.ctx_org_id)
         user = self.scope["user"]
-        try:
-            await r.hdel(key, str(user.id))
-        except Exception:
-            return
+        await _await_with_timeout(r.hdel(key, str(user.id)))
 
     async def _release_all_user_locks(self):
         user = self.scope.get("user")
@@ -609,21 +697,25 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
             return
         r = _redis_client()
         ukey = _user_locks_key(org_id=self.ctx_org_id, user_id=user.id)
+        keys = await _await_with_timeout(r.smembers(ukey))
+        if not keys:
+            return
+        uid = str(user.id)
         try:
-            keys = await r.smembers(ukey)
+            pipe = r.pipeline()
+            for k in keys:
+                pipe.get(k)
+            values = await _await_with_timeout(pipe.execute())
+            if values is None:
+                return
+            to_delete = [k for k, v in zip(keys, values) if v == uid]
+            pipe = r.pipeline()
+            for k in to_delete:
+                pipe.delete(k)
+            pipe.delete(ukey)
+            await _await_with_timeout(pipe.execute())
         except Exception:
             return
-        for k in keys:
-            try:
-                locked_by = await r.get(k)
-                if locked_by == str(user.id):
-                    await r.delete(k)
-            except Exception:
-                continue
-        try:
-            await r.delete(ukey)
-        except Exception:
-            pass
 
     async def _release_all_user_page_edits(self):
         user = self.scope.get("user")
@@ -631,27 +723,39 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
             return
         r = _redis_client()
         ukey = _user_page_edits_key(org_id=self.ctx_org_id, user_id=user.id)
+        keys = await _await_with_timeout(r.smembers(ukey))
+        if not keys:
+            return
+        uid = str(user.id)
         try:
-            keys = await r.smembers(ukey)
+            pipe = r.pipeline()
+            for k in keys:
+                pipe.get(k)
+            values = await _await_with_timeout(pipe.execute())
+            if values is None:
+                return
+            to_delete: list[str] = []
+            payloads: list[dict[str, Any]] = []
+            for k, v in zip(keys, values):
+                if v != uid:
+                    continue
+                to_delete.append(k)
+                payload = _page_edit_payload_from_key(k, active=False)
+                if payload:
+                    payloads.append(payload)
+            pipe = r.pipeline()
+            for k in to_delete:
+                pipe.delete(k)
+            pipe.delete(ukey)
+            await _await_with_timeout(pipe.execute())
+            for payload in payloads:
+                await _safe_group_send(
+                    self.channel_layer,
+                    self.group,
+                    {"type": "broadcast", "payload": payload},
+                )
         except Exception:
             return
-        for k in keys:
-            try:
-                locked_by = await r.get(k)
-                if locked_by == str(user.id):
-                    await r.delete(k)
-                    payload = _page_edit_payload_from_key(k, active=False)
-                    if payload:
-                        await self.channel_layer.group_send(
-                            self.group,
-                            {"type": "broadcast", "payload": payload},
-                        )
-            except Exception:
-                continue
-        try:
-            await r.delete(ukey)
-        except Exception:
-            pass
 
     async def _handle_lock(self, msg: dict[str, Any]):
         entity = str(msg.get("entity") or "operation").strip().lower()
@@ -902,18 +1006,23 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
             return
 
         user = self.scope["user"]
+        source = str(msg.get("source") or "input").strip().lower()
+        if source not in ("input", "whatif"):
+            source = "input"
         key = page_edit_lock_key(
             org_id=self.ctx_org_id,
             model_id=model_id,
             page=page,
             product_id=product_id,
         )
-        base = {"model_id": model_id, "page": page}
+        base = {"model_id": model_id, "page": page, "source": source}
         if product_id:
             base["product_id"] = product_id
 
         if not _redis_enabled():
-            ok = mem_try_page_edit(key=key, user_id=str(user.id), name=self.profile_name)
+            ok = mem_try_page_edit(
+                key=key, user_id=str(user.id), name=self.profile_name, source=source
+            )
             if ok:
                 await self.send_json(
                     {
@@ -938,12 +1047,16 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
                 )
             else:
                 holder = mem_get_page_edit(key)
+                holder_id = holder[0] if holder else None
+                holder_name = holder[1] if holder else "Another user"
+                holder_source = holder[2] if holder else "input"
                 await self.send_json(
                     {
                         "type": "page_edit_denied",
                         **base,
-                        "locked_by": holder[0] if holder else None,
-                        "name": holder[1] if holder else "Another user",
+                        "source": holder_source,
+                        "locked_by": holder_id,
+                        "name": holder_name,
                     }
                 )
                 if holder:
@@ -954,9 +1067,10 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
                             "payload": {
                                 "type": "page_edit_changed",
                                 "active": True,
-                                "locked_by": holder[0],
-                                "name": holder[1],
-                                **base,
+                                "locked_by": holder_id,
+                                "name": holder_name,
+                                "source": holder_source,
+                                **{k: v for k, v in base.items() if k != "source"},
                             },
                         },
                     )
@@ -969,6 +1083,7 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
             ok = True
         if ok:
             try:
+                await r.set(f"{key}:source", source, ex=PAGE_EDIT_TTL_SECONDS)
                 await r.sadd(_user_page_edits_key(org_id=self.ctx_org_id, user_id=user.id), key)
                 await r.expire(
                     _user_page_edits_key(org_id=self.ctx_org_id, user_id=user.id),
@@ -1000,8 +1115,10 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
         else:
             try:
                 locked_by = await r.get(key)
+                holder_source = await r.get(f"{key}:source")
             except Exception:
                 locked_by = None
+                holder_source = None
             holder_name = None
             if locked_by:
                 try:
@@ -1015,6 +1132,7 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
                 {
                     "type": "page_edit_denied",
                     **base,
+                    "source": str(holder_source or "input"),
                     "locked_by": locked_by,
                     "name": holder_name,
                 }
@@ -1029,7 +1147,8 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
                             "active": True,
                             "locked_by": locked_by,
                             "name": holder_name,
-                            **base,
+                            "source": str(holder_source or "input"),
+                            **{k: v for k, v in base.items() if k != "source"},
                         },
                     },
                 )
@@ -1061,6 +1180,7 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
                 locked_by = await r.get(key)
                 if locked_by == str(user.id):
                     await r.delete(key)
+                    await r.delete(f"{key}:source")
                 await r.srem(_user_page_edits_key(org_id=self.ctx_org_id, user_id=user.id), key)
             except Exception:
                 pass
@@ -1070,6 +1190,169 @@ class OrganizationCollaborationConsumer(AsyncWebsocketConsumer):
             {
                 "type": "broadcast",
                 "payload": {"type": "page_edit_changed", "active": False, **base},
+            },
+        )
+
+    async def _handle_acquire_whatif_edit(self, msg: dict[str, Any]):
+        model_id = str(msg.get("model_id") or "")
+        scenario_id = str(msg.get("scenario_id") or "")
+        if not model_id or not scenario_id:
+            return
+        if not await self._model_in_org(model_id):
+            return
+
+        user = self.scope["user"]
+        key = whatif_edit_lock_key(
+            org_id=self.ctx_org_id,
+            model_id=model_id,
+            scenario_id=scenario_id,
+        )
+        base = {"model_id": model_id, "scenario_id": scenario_id}
+
+        if not _redis_enabled():
+            ok = mem_try_whatif_edit(key=key, user_id=str(user.id), name=self.profile_name)
+            if ok:
+                await self.send_json(
+                    {
+                        "type": "whatif_edit_acquired",
+                        "locked_by": user.id,
+                        "name": self.profile_name,
+                        **base,
+                    }
+                )
+                await self.channel_layer.group_send(
+                    self.group,
+                    {
+                        "type": "broadcast",
+                        "payload": {
+                            "type": "whatif_edit_changed",
+                            "active": True,
+                            "locked_by": user.id,
+                            "name": self.profile_name,
+                            **base,
+                        },
+                    },
+                )
+            else:
+                holder = mem_get_whatif_edit(key)
+                await self.send_json(
+                    {
+                        "type": "whatif_edit_denied",
+                        **base,
+                        "locked_by": holder[0] if holder else None,
+                        "name": holder[1] if holder else "Another user",
+                    }
+                )
+                if holder:
+                    await self.channel_layer.group_send(
+                        self.group,
+                        {
+                            "type": "broadcast",
+                            "payload": {
+                                "type": "whatif_edit_changed",
+                                "active": True,
+                                "locked_by": holder[0],
+                                "name": holder[1],
+                                **base,
+                            },
+                        },
+                    )
+            return
+
+        r = _redis_client()
+        try:
+            ok = await r.set(key, str(user.id), nx=True, ex=WHATIF_EDIT_TTL_SECONDS)
+        except Exception:
+            ok = True
+        if ok:
+            await self.send_json(
+                {
+                    "type": "whatif_edit_acquired",
+                    "locked_by": user.id,
+                    "name": self.profile_name,
+                    **base,
+                }
+            )
+            await self.channel_layer.group_send(
+                self.group,
+                {
+                    "type": "broadcast",
+                    "payload": {
+                        "type": "whatif_edit_changed",
+                        "active": True,
+                        "locked_by": user.id,
+                        "name": self.profile_name,
+                        **base,
+                    },
+                },
+            )
+        else:
+            try:
+                locked_by = await r.get(key)
+            except Exception:
+                locked_by = None
+            holder_name = None
+            if locked_by:
+                try:
+                    holder_name = await r.hget(
+                        _presence_key(org_id=self.ctx_org_id), locked_by
+                    )
+                except Exception:
+                    holder_name = None
+            holder_name = holder_name or "Another user"
+            await self.send_json(
+                {
+                    "type": "whatif_edit_denied",
+                    **base,
+                    "locked_by": locked_by,
+                    "name": holder_name,
+                }
+            )
+            if locked_by:
+                await self.channel_layer.group_send(
+                    self.group,
+                    {
+                        "type": "broadcast",
+                        "payload": {
+                            "type": "whatif_edit_changed",
+                            "active": True,
+                            "locked_by": locked_by,
+                            "name": holder_name,
+                            **base,
+                        },
+                    },
+                )
+
+    async def _handle_release_whatif_edit(self, msg: dict[str, Any]):
+        model_id = str(msg.get("model_id") or "")
+        scenario_id = str(msg.get("scenario_id") or "")
+        if not model_id or not scenario_id:
+            return
+
+        user = self.scope["user"]
+        key = whatif_edit_lock_key(
+            org_id=self.ctx_org_id,
+            model_id=model_id,
+            scenario_id=scenario_id,
+        )
+        base = {"model_id": model_id, "scenario_id": scenario_id}
+
+        if not _redis_enabled():
+            mem_release_whatif_edit(key=key, user_id=str(user.id))
+        else:
+            r = _redis_client()
+            try:
+                locked_by = await r.get(key)
+                if locked_by == str(user.id):
+                    await r.delete(key)
+            except Exception:
+                pass
+
+        await self.channel_layer.group_send(
+            self.group,
+            {
+                "type": "broadcast",
+                "payload": {"type": "whatif_edit_changed", "active": False, **base},
             },
         )
 

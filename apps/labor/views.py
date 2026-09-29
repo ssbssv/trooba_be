@@ -115,7 +115,7 @@ def get_labors(request):
 # Get Single Labor
 # GET /api/labor/{id}
 # -------------------------------------------------------
-def get_labor(request, labor_id):
+def get_labor(_request, labor_id):
 
     labor = get_object_or_404(Labor, id=labor_id)
 
@@ -239,7 +239,7 @@ def model_labor_create(request, model_id):
         "count": data.get("count", 1),
         "overtime_percent": data.get("overtime_pct", 0),
         "unavailability_percent": data.get("unavail_pct", 0),
-        "department": data.get("dept_code") or None,
+        "department": data.get("dept_code") or "",
         "setup_factor": data.get("setup_factor", 1),
         "run_factor": data.get("run_factor", 1),
         "variable_factor": data.get("var_factor", 1),
@@ -307,41 +307,47 @@ def model_labor_update(request, model_id, labor_id):
     if request.method != "PATCH":
         return JsonResponse({"error": "PATCH method required"}, status=405)
 
-    m = get_object_or_404(RMCMModel, id=model_id)
+    model = get_object_or_404(RMCMModel, id=model_id)
+
     data = _parse_json(request)
     if data is None:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
-    labor = get_object_or_404(Labor, id=labor_id, model=m)
+    labor = get_object_or_404(
+        Labor,
+        id=labor_id,
+        model=model,
+    )
 
-    if "name" in data:
-        labor.name = data["name"]
-    if "count" in data:
-        labor.count = data["count"]
-    if "overtime_pct" in data:
-        labor.overtime_percent = data["overtime_pct"]
-    if "unavail_pct" in data:
-        labor.unavailability_percent = data["unavail_pct"]
-    if "dept_code" in data:
-        labor.department = data["dept_code"] or None
-    if "setup_factor" in data:
-        labor.setup_factor = data["setup_factor"]
-    if "run_factor" in data:
-        labor.run_factor = data["run_factor"]
-    if "var_factor" in data:
-        labor.variable_factor = data["var_factor"]
-    if "prioritize_use" in data:
-        labor.prioritize = data["prioritize_use"]
-    for key, field in (("lab1", "lab1"), ("lab2", "lab2"), ("lab3", "lab3"), ("lab4", "lab4")):
-        if key in data:
-            setattr(labor, field, data[key])
-    if "comments" in data:
-        labor.notes = data["comments"]
+    _update_labor_fields(labor, data)
 
     labor.save()
 
     return JsonResponse({})
+    
+def _update_labor_fields(labor, data):
+    field_map = {
+        "name": "name",
+        "count": "count",
+        "overtime_pct": "overtime_percent",
+        "unavail_pct": "unavailability_percent",
+        "setup_factor": "setup_factor",
+        "run_factor": "run_factor",
+        "var_factor": "variable_factor",
+        "prioritize_use": "prioritize",
+        "comments": "notes",
+    }
 
+    for request_field, model_field in field_map.items():
+        if request_field in data:
+            setattr(labor, model_field, data[request_field])
+
+    if "dept_code" in data:
+        labor.department = data["dept_code"] or ""
+
+    for key in ("lab1", "lab2", "lab3", "lab4"):
+        if key in data:
+            setattr(labor, key, data[key])
 
 @csrf_exempt
 def model_labor_delete(request, model_id, labor_id):
